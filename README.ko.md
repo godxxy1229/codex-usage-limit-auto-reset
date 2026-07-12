@@ -1,10 +1,10 @@
 # Codex 사용 한도 초기화 관리자
 
-Codex Usage Limit Reset Manager는 작고 단순한 커뮤니티 제작 Windows 도구입니다. OpenAI Codex에서 선택한 사용 한도 초기화 한 건을 만료 약 5분 전에 자동으로 사용합니다. 몇 개의 Python 및 PowerShell 스크립트와 작은 Tkinter UI, Windows 작업 스케줄러, 로컬 Codex CLI app-server를 결합한 토이 프로젝트입니다.
+Codex Usage Limit Reset Manager는 작고 단순한 커뮤니티 제작 Windows용 Codex reset scheduler입니다. OpenAI Codex에서 선택한 사용 한도 초기화 한 건을 만료 약 5분 전에 자동으로 사용합니다. 몇 개의 Python 및 PowerShell 스크립트와 작은 Tkinter UI, Windows 작업 스케줄러, 로컬 Codex CLI app-server를 결합한 토이 프로젝트입니다.
 
 ChatGPT 화면에는 이 기능이 **Usage limit resets**로 표시됩니다. 과거 게시물에서는 **Codex reset credits**라고 부르기도 하며, 로컬 Codex app-server는 내부적으로 rate-limit reset credit 용어를 사용합니다.
 
-추가 사용 한도 초기화를 만들거나 플랜의 사용 한도를 늘리지 않으며, `auth.json`을 읽거나 backend API를 직접 호출하지 않습니다.
+**Codex auto redeem reset**, **Codex auto reset reserve** 같은 검색 문구는 이 프로젝트에서 기존 사용 한도 초기화 항목의 사용을 예약하고 실행한다는 뜻일 뿐이며, 추가 초기화를 만들거나 플랜의 사용 한도를 늘리지 않고 `auth.json`을 읽거나 backend API를 직접 호출하지 않습니다.
 
 영문 문서는 [README.md](README.md)에 있습니다.
 
