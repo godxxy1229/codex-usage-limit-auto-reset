@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Fail-closed guard for one-shot Codex reset-credit consumption.
+"""Fail-closed guard for one-shot Codex usage limit reset use.
 
 The guard only talks to the local Codex app-server.  It never reads
-``auth.json`` and never persists a raw reset-credit identifier.
+``auth.json`` and never persists a raw usage limit reset identifier.
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 
 
 UTC = timezone.utc
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.1.0"
 LEGACY_MANIFEST_SCHEMA_VERSION = 1
 MANIFEST_SCHEMA_VERSION = 2
 SUPPORTED_MANIFEST_SCHEMA_VERSIONS = {
@@ -225,16 +225,16 @@ def _credit_records(full_response: Mapping[str, Any]) -> list[CreditRecord]:
         raise GuardError("rate-limit response must be an object")
     summary = full_response.get("rateLimitResetCredits")
     if not isinstance(summary, Mapping):
-        raise GuardError("reset-credit summary is missing")
-    _expect_exact_keys(dict(summary), {"availableCount", "credits"}, "reset-credit summary")
+        raise GuardError("usage limit reset summary is missing")
+    _expect_exact_keys(dict(summary), {"availableCount", "credits"}, "usage limit reset summary")
     available_count = summary.get("availableCount")
     credits = summary.get("credits")
     if not _is_int(available_count) or available_count < 0:
         raise GuardError("availableCount must be a non-negative integer")
     if not isinstance(credits, list):
-        raise GuardError("reset-credit details are unavailable")
+        raise GuardError("usage limit reset details are unavailable")
     if len(credits) != available_count:
-        raise GuardError("reset-credit details are incomplete or capped")
+        raise GuardError("usage limit reset details are incomplete or capped")
 
     result: list[CreditRecord] = []
     ids: set[str] = set()
@@ -249,8 +249,8 @@ def _credit_records(full_response: Mapping[str, Any]) -> list[CreditRecord]:
     }
     for row in credits:
         if not isinstance(row, Mapping):
-            raise GuardError("reset-credit detail must be an object")
-        _expect_exact_keys(dict(row), allowed_keys, "reset-credit detail")
+            raise GuardError("usage limit reset detail must be an object")
+        _expect_exact_keys(dict(row), allowed_keys, "usage limit reset detail")
         raw_id = row.get("id")
         granted_at = row.get("grantedAt")
         expires_at = row.get("expiresAt")
@@ -259,22 +259,22 @@ def _credit_records(full_response: Mapping[str, Any]) -> list[CreditRecord]:
         title = row.get("title")
         description = row.get("description")
         if not isinstance(raw_id, str) or not raw_id.strip():
-            raise GuardError("reset-credit ID is missing or blank")
+            raise GuardError("usage limit reset ID is missing or blank")
         if raw_id in ids:
-            raise GuardError("reset-credit IDs are not unique")
+            raise GuardError("usage limit reset IDs are not unique")
         ids.add(raw_id)
         if not _is_int(granted_at) or granted_at <= 0:
             raise GuardError("grantedAt must be a positive integer")
         if expires_at is not None and (not _is_int(expires_at) or expires_at <= 0):
             raise GuardError("expiresAt must be null or a positive integer")
         if reset_type != "codexRateLimits":
-            raise GuardError("unknown reset-credit type")
+            raise GuardError("unknown usage limit reset type")
         if status != "available":
-            raise GuardError("reset-credit is not available")
+            raise GuardError("usage limit reset is not available")
         if title is not None and not isinstance(title, str):
-            raise GuardError("reset-credit title has an unexpected type")
+            raise GuardError("usage limit reset title has an unexpected type")
         if description is not None and not isinstance(description, str):
-            raise GuardError("reset-credit description has an unexpected type")
+            raise GuardError("usage limit reset description has an unexpected type")
         result.append(
             CreditRecord(
                 raw_id=raw_id,
@@ -292,7 +292,7 @@ def select_unique_earliest_credit(full_rate_limits_response: Mapping[str, Any]) 
     records = _credit_records(full_rate_limits_response)
     finite = [record for record in records if record.expires_at is not None]
     if not finite:
-        raise GuardError("no expiring reset credit is available")
+        raise GuardError("no expiring usage limit reset is available")
     earliest_expiry = min(record.expires_at for record in finite)
     earliest = [record for record in finite if record.expires_at == earliest_expiry]
     if len(earliest) != 1:
@@ -315,9 +315,9 @@ def make_target_pin(credit: Mapping[str, Any]) -> dict[str, Any]:
     granted_at = credit.get("grantedAt")
     reset_type = credit.get("resetType")
     if not isinstance(raw_id, str) or not raw_id.strip():
-        raise GuardError("target credit ID is missing")
+        raise GuardError("target usage limit reset ID is missing")
     if not _is_int(expires_at) or expires_at <= 0:
-        raise GuardError("target credit must have a finite expiration")
+        raise GuardError("target usage limit reset must have a finite expiration")
     if not _is_int(granted_at) or granted_at <= 0:
         raise GuardError("target grantedAt is invalid")
     if reset_type != "codexRateLimits":
@@ -335,7 +335,7 @@ def _validate_target_pin(pin: Mapping[str, Any]) -> None:
         raise GuardError("target pin shape is invalid")
     digest = pin.get("creditIdSha256")
     if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
-        raise GuardError("target credit hash is invalid")
+        raise GuardError("target usage limit reset hash is invalid")
     if not _is_int(pin.get("expiresAt")) or pin["expiresAt"] <= 0:
         raise GuardError("target expiration is invalid")
     if not _is_int(pin.get("grantedAt")) or pin["grantedAt"] <= 0:
@@ -349,7 +349,7 @@ def resolve_pinned_credit(full_rate_limits_response: Mapping[str, Any], pin: Map
     records = _credit_records(full_rate_limits_response)
     matches = [record for record in records if record.id_sha256 == pin["creditIdSha256"]]
     if len(matches) != 1:
-        raise GuardError("the pinned reset credit is missing or ambiguous")
+        raise GuardError("the pinned usage limit reset is missing or ambiguous")
     target = matches[0]
     if (
         target.expires_at != pin["expiresAt"]
@@ -357,13 +357,13 @@ def resolve_pinned_credit(full_rate_limits_response: Mapping[str, Any], pin: Map
         or target.reset_type != pin["resetType"]
         or target.status != "available"
     ):
-        raise GuardError("the pinned reset-credit metadata changed")
+        raise GuardError("the pinned usage limit reset metadata changed")
     finite = [record for record in records if record.expires_at is not None]
     if not finite:
-        raise GuardError("no finite reset-credit expiration is available")
+        raise GuardError("no finite usage limit reset expiration is available")
     minimum = min(record.expires_at for record in finite)
     if target.expires_at != minimum:
-        raise GuardError("a different reset credit expires earlier")
+        raise GuardError("a different usage limit reset expires earlier")
     if sum(1 for record in finite if record.expires_at == minimum) != 1:
         raise GuardError("the earliest expiration is tied")
     return target.raw_id
@@ -923,7 +923,7 @@ class AppServerTransport:
             {
                 "clientInfo": {
                     "name": "codex-reset-credit-guard",
-                    "title": "Codex Reset Credit Guard",
+                    "title": "Codex Usage Limit Reset Guard",
                     "version": APP_VERSION,
                 }
             },
@@ -1282,7 +1282,7 @@ def _validate_cli_schema(exe: Path) -> None:
         properties = consume_params.get("properties", {})
         required = consume_params.get("required", [])
         if "creditId" not in properties or "idempotencyKey" not in required:
-            raise GuardError("Codex consume contract no longer supports exact credit IDs")
+            raise GuardError("Codex consume contract no longer supports exact creditId values")
         serialized_consume = json.dumps(consume_response, sort_keys=True)
         for outcome in ("reset", "nothingToReset", "noCredit", "alreadyRedeemed"):
             if outcome not in serialized_consume:
@@ -1290,7 +1290,7 @@ def _validate_cli_schema(exe: Path) -> None:
         serialized_rates = json.dumps(rate_response, sort_keys=True)
         for field_name in ("RateLimitResetCredit", "availableCount", "credits", "expiresAt", "grantedAt"):
             if field_name not in serialized_rates:
-                raise GuardError("Codex reset-credit detail contract changed")
+                raise GuardError("Codex usage limit reset detail contract changed")
 
 
 def _time_status() -> str:
@@ -2318,7 +2318,7 @@ def _default_codex_home() -> Path:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Fail-closed Codex reset-credit guard")
+    parser = argparse.ArgumentParser(description="Fail-closed Codex usage-limit-reset guard")
     parser.add_argument("--version", action="version", version=f"%(prog)s {APP_VERSION}")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -2326,11 +2326,11 @@ def _build_parser() -> argparse.ArgumentParser:
         command.add_argument("--codex-path", help="absolute npm native codex.exe path")
         command.add_argument("--codex-home", type=Path, default=_default_codex_home())
 
-    probe = subparsers.add_parser("probe", help="read-only account and reset-credit probe")
+    probe = subparsers.add_parser("probe", help="read-only account and usage-limit-reset probe")
     add_runtime_options(probe)
     probe.add_argument("--json", action="store_true", help="emit sanitized JSON")
 
-    enroll = subparsers.add_parser("enroll", help="pin the unique earliest reset credit")
+    enroll = subparsers.add_parser("enroll", help="pin the unique earliest usage limit reset")
     add_runtime_options(enroll)
     enroll.add_argument("--earliest", action="store_true", required=True)
     enroll.add_argument("--manifest", type=Path, required=True)

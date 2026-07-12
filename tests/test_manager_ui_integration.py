@@ -302,6 +302,7 @@ class ManagerUiIntegrationTests(unittest.TestCase):
     def test_modern_client_dimensions_styles_and_footer(self) -> None:
         root, _, _ = self._run(tray_starts=False)
 
+        self.assertEqual(root.title_value, "Codex Usage Limit Reset Manager")
         self.assertEqual(root.geometry_value, "600x430")
         self.assertEqual(root.minsize_value, (560, 400))
         self.assertEqual(root.options["background"], "#FFFFFF")
@@ -318,6 +319,18 @@ class ManagerUiIntegrationTests(unittest.TestCase):
                 for widget in _Widget.instances
             )
         )
+        visible_text = {
+            str(widget.options["text"])
+            for widget in _Widget.instances
+            if "text" in widget.options
+        }
+        self.assertIn("Codex Usage Limit Reset Manager", visible_text)
+        self.assertIn(
+            "Safely uses one selected usage limit reset about five minutes before it expires.",
+            visible_text,
+        )
+        self.assertIn("Next reset expires", visible_text)
+        self.assertNotIn("Codex Reset Credit Manager", visible_text)
 
     def test_status_text_tones_are_semantic_and_supplemental(self) -> None:
         expected = {

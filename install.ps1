@@ -2,7 +2,7 @@
 
 <#
 .SYNOPSIS
-Installs the Codex Reset Credit Manager or creates one controller-owned job.
+Installs the Codex Usage Limit Reset Manager or creates one controller-owned job.
 
 .DESCRIPTION
 Normal mode installs immutable guard, manager, and installer files, creates the
@@ -11,7 +11,7 @@ manager once.  It never enables continuous operation and never creates a second
 job while adopting an existing v1 job.
 
 -ManagerChildOnly is an internal controller mode.  It performs the original
-fail-closed enrollment flow for exactly one uniquely earliest credit, emits the
+fail-closed enrollment flow for exactly one uniquely earliest usage limit reset, emits the
 created job as JSON, and creates no manager task, shortcut, or UI process.
 
 Windows Time configuration is intentionally opt-in because it changes a machine
@@ -70,9 +70,11 @@ $ErrorActionPreference = 'Stop'
 $TaskFolder = '\CodexResetCredit\'
 $ManagerTaskName = 'ManagerSync'
 $ManagerSyncIntervalMinutes = 30
-$ManagerShortcutName = 'Codex Reset Credit Manager.lnk'
-# This literal is intentionally retained solely to remove the exact shortcut
-# created by older Korean-language releases. It must never be used as a glob.
+$ManagerShortcutName = 'Codex Usage Limit Reset Manager.lnk'
+# These literals are intentionally retained solely to remove the exact
+# shortcuts created by older English- and Korean-language releases. They must
+# never be used as globs.
+$CurrentManagerShortcutName = 'Codex Reset Credit Manager.lnk'
 $LegacyManagerShortcutName = 'Codex 초기화권 자동 사용.lnk'
 $CodexPathEnvironmentVariable = 'CODEX_RESET_GUARD_CODEX_PATH'
 $RuntimeInstallerEnvironmentVariable = 'CODEX_RESET_MANAGER_RUNTIME_INSTALLER'
@@ -1240,7 +1242,7 @@ function Set-AndAssertManagerShortcut {
         [Parameter(Mandatory)][string] $WorkingDirectory
     )
 
-    $shortcutDescription = 'Manage automatic Codex reset credit use'
+    $shortcutDescription = 'Manage automatic use of Codex usage limit resets'
     $shell = New-Object -ComObject WScript.Shell
     try {
         $shortcut = $shell.CreateShortcut($ShortcutPath)
@@ -1635,17 +1637,17 @@ Write-Host "Runtime: $installRoot"
 if ($ManagerChildOnly) { Write-Host "Manifest: $manifestPath" }
 
 if ($WhatIfPreference) {
-    $modeDescription = if ($ManagerChildOnly) { 'Create one controller-owned guarded reset-credit job' } else { 'Install manager runtime and disabled policy bootstrap' }
+    $modeDescription = if ($ManagerChildOnly) { 'Create one controller-owned guarded usage-limit-reset job' } else { 'Install manager runtime and disabled policy bootstrap' }
     $null = $PSCmdlet.ShouldProcess($installRoot, $modeDescription)
     if ($ConfigureWindowsTime) {
         $null = $PSCmdlet.ShouldProcess('Windows Time service', 'Repair only if verification fails')
     }
     if ($ManagerChildOnly) {
-        $null = $PSCmdlet.ShouldProcess("$TaskFolder<Task derived from enrolled credit hash>", 'Register and verify one-shot task, then arm manifest')
+        $null = $PSCmdlet.ShouldProcess("$TaskFolder<Task derived from enrolled usage limit reset hash>", 'Register and verify one-shot task, then arm manifest')
     }
     else {
         $null = $PSCmdlet.ShouldProcess("$TaskFolder$ManagerTaskName", "Register and verify logon plus $ManagerSyncIntervalMinutes-minute controller task")
-        $null = $PSCmdlet.ShouldProcess('Current-user Start Menu', 'Create and verify the English manager shortcut, then remove the exact legacy shortcut')
+        $null = $PSCmdlet.ShouldProcess('Current-user Start Menu', 'Create and verify the usage limit reset manager shortcut, then remove the exact prior English and Korean shortcuts')
     }
     Write-Host 'WhatIf complete. No Python command, file write, time change, task registration, shortcut, or GUI launch was performed.'
     return
@@ -1770,6 +1772,7 @@ if (-not $ManagerChildOnly) {
     $programsDirectory = [Environment]::GetFolderPath([Environment+SpecialFolder]::Programs)
     if ([string]::IsNullOrWhiteSpace($programsDirectory)) { throw 'Current-user Start Menu directory is unavailable.' }
     $shortcutPath = Join-Path $programsDirectory $ManagerShortcutName
+    $currentShortcutPath = Join-Path $programsDirectory $CurrentManagerShortcutName
     $legacyShortcutPath = Join-Path $programsDirectory $LegacyManagerShortcutName
 
     # Snapshot every mutable installation surface before stopping a UI or
@@ -1788,6 +1791,7 @@ if (-not $ManagerChildOnly) {
     }
     $managerTaskSnapshot = Get-ManagerTaskSnapshot
     $shortcutSnapshot = Get-FileByteSnapshot -Path $shortcutPath
+    $currentShortcutSnapshot = Get-FileByteSnapshot -Path $currentShortcutPath
     $legacyShortcutSnapshot = Get-FileByteSnapshot -Path $legacyShortcutPath
     $priorManagerUis = @(Get-InstalledManagerUiProcesses -InstallRoot $installRoot)
     if ($priorManagerUis.Count -gt 1) {
@@ -1800,7 +1804,8 @@ if (-not $ManagerChildOnly) {
     $priorUiWasStopped = $false
     $managerTaskDefinitionReplaced = $false
     $policyMutationAttempted = $false
-    $englishShortcutMutationAttempted = $false
+    $managerShortcutMutationAttempted = $false
+    $currentShortcutMutationAttempted = $false
     $legacyShortcutMutationAttempted = $false
     try {
         # Prevent a scheduled controller from starting again while this
@@ -1894,7 +1899,7 @@ if (-not $ManagerChildOnly) {
 
         $shortcutVerified = $false
         if ($PSCmdlet.ShouldProcess($shortcutPath, 'Create and verify manager shortcut')) {
-            $englishShortcutMutationAttempted = $true
+            $managerShortcutMutationAttempted = $true
             Set-AndAssertManagerShortcut `
                 -ShortcutPath $shortcutPath `
                 -Pythonw $python.WindowlessPath `
@@ -1903,7 +1908,7 @@ if (-not $ManagerChildOnly) {
             $shortcutVerified = $true
         }
 
-        if ($PSCmdlet.ShouldProcess('Codex Reset Credit Manager', 'Open the manager window once')) {
+        if ($PSCmdlet.ShouldProcess('Codex Usage Limit Reset Manager', 'Open the manager window once')) {
             $replacementUiProcess = Start-Process `
                 -FilePath $python.WindowlessPath `
                 -ArgumentList @((Quote-WindowsArgument $runtimeManager), 'ui') `
@@ -1933,13 +1938,20 @@ if (-not $ManagerChildOnly) {
         else {
             Write-Host 'Manager installed. Automatic operation remains paused until the user selects Start Automatic Use.'
         }
-        # Remove only the exact shortcut written by the former Korean release,
-        # and only after the replacement has been created and read back. Never
-        # use a wildcard here: unrelated user shortcuts must be preserved.
+        # Remove only the exact shortcuts written by the former English and
+        # Korean releases, and only after the replacement has been created and
+        # read back. Never use a wildcard here: unrelated user shortcuts must
+        # be preserved.
         Assert-ActiveOneShotUnchanged -Snapshot $activeOneShotSnapshot
         if ($shortcutVerified -and
+            (Test-Path -LiteralPath $currentShortcutPath -PathType Leaf) -and
+            $PSCmdlet.ShouldProcess($currentShortcutPath, 'Remove exact prior English manager shortcut after replacement verification')) {
+            $currentShortcutMutationAttempted = $true
+            Remove-Item -LiteralPath $currentShortcutPath -Force
+        }
+        if ($shortcutVerified -and
             (Test-Path -LiteralPath $legacyShortcutPath -PathType Leaf) -and
-            $PSCmdlet.ShouldProcess($legacyShortcutPath, 'Remove exact legacy manager shortcut after replacement verification')) {
+            $PSCmdlet.ShouldProcess($legacyShortcutPath, 'Remove exact prior Korean manager shortcut after replacement verification')) {
             $legacyShortcutMutationAttempted = $true
             Remove-Item -LiteralPath $legacyShortcutPath -Force
         }
@@ -2010,7 +2022,8 @@ if (-not $ManagerChildOnly) {
         $laterMutationAttempted = (
             $policyMutationAttempted -or
             $managerTaskDefinitionReplaced -or
-            $englishShortcutMutationAttempted -or
+            $managerShortcutMutationAttempted -or
+            $currentShortcutMutationAttempted -or
             $legacyShortcutMutationAttempted -or
             $null -ne $replacementUiProcess
         )
@@ -2047,14 +2060,19 @@ if (-not $ManagerChildOnly) {
         }
         catch { $rollbackErrors.Add("ManagerSync: $($_.Exception.Message)") }
 
-        if ($englishShortcutMutationAttempted) {
+        if ($managerShortcutMutationAttempted) {
             try { Restore-FileByteSnapshot -Path $shortcutPath -Snapshot $shortcutSnapshot }
-            catch { $rollbackErrors.Add("English shortcut: $($_.Exception.Message)") }
+            catch { $rollbackErrors.Add("manager shortcut: $($_.Exception.Message)") }
+        }
+
+        if ($currentShortcutMutationAttempted) {
+            try { Restore-FileByteSnapshot -Path $currentShortcutPath -Snapshot $currentShortcutSnapshot }
+            catch { $rollbackErrors.Add("prior English shortcut: $($_.Exception.Message)") }
         }
 
         if ($legacyShortcutMutationAttempted) {
             try { Restore-FileByteSnapshot -Path $legacyShortcutPath -Snapshot $legacyShortcutSnapshot }
-            catch { $rollbackErrors.Add("legacy shortcut: $($_.Exception.Message)") }
+            catch { $rollbackErrors.Add("prior Korean shortcut: $($_.Exception.Message)") }
         }
 
         try {
@@ -2121,7 +2139,7 @@ try {
     Write-Host 'Running read-only Codex app-server contract probe...'
     Invoke-Guard -Python $python.Path -Runner $runtimeRunner -NativeCodex $codex.Path -Arguments @('probe')
 
-    if ($PSCmdlet.ShouldProcess($manifestPath, 'Enroll uniquely earliest reset credit into an unarmed manifest')) {
+    if ($PSCmdlet.ShouldProcess($manifestPath, 'Enroll uniquely earliest usage limit reset into an unarmed manifest')) {
         Invoke-Guard -Python $python.Path -Runner $runtimeRunner -NativeCodex $codex.Path -Arguments @(
             'enroll', '--earliest', '--manifest', $manifestPath
         )
@@ -2142,9 +2160,9 @@ try {
 
     $creditHash = [string] (Get-JsonPathValue -Object $manifest -CandidatePaths @(
         'target.creditIdSha256', 'target.credit_id_sha256', 'target.idSha256', 'creditIdSha256', 'credit_id_sha256'
-    ) -Description 'the target credit ID SHA-256')
+    ) -Description 'the target usage limit reset ID SHA-256')
     if ($creditHash -notmatch '^[0-9a-fA-F]{64}$') {
-        throw 'Manifest target credit hash is not a SHA-256 value.'
+        throw 'Manifest target usage limit reset hash is not a SHA-256 value.'
     }
     $jobIdText = [string] (Get-JsonPathValue -Object $manifest -CandidatePaths @(
         'jobId', 'job_id'
@@ -2187,7 +2205,7 @@ try {
     }
     $minimumTrigger = [DateTimeOffset]::UtcNow.AddMinutes($MinimumLeadTimeMinutes)
     if ($triggerAt -lt $minimumTrigger) {
-        throw "Trigger is less than $MinimumLeadTimeMinutes minutes away. No other credit will be selected automatically."
+        throw "Trigger is less than $MinimumLeadTimeMinutes minutes away. No other usage limit reset will be selected automatically."
     }
 
     if ([string]::IsNullOrWhiteSpace($TaskName)) {

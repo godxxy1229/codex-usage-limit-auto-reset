@@ -581,6 +581,23 @@ class ManagerControllerTests(unittest.TestCase):
 
         self.assertEqual(len(self.services.notifications), count)
 
+    def test_notifications_use_usage_limit_reset_terminology(self) -> None:
+        self.controller.enable()
+        self.assertEqual(
+            self.services.notifications[-1][0],
+            "Codex Usage Limit Reset Scheduled",
+        )
+
+        self.controller.pause()
+        self.assertEqual(
+            self.services.notifications[-1][0],
+            "Codex Usage Limit Reset Manager",
+        )
+        rendered = "\n".join(
+            f"{title}\n{message}" for title, message, _level in self.services.notifications
+        )
+        self.assertNotIn("reset credit", rendered.casefold())
+
     def test_policy_and_manager_log_never_copy_manifest_secrets(self) -> None:
         write_manifest(self.root, self.first, suffix="secret-source")
         self.controller.enable()

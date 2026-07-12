@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Small, fail-closed controller and UI for Codex reset-credit one-shot jobs.
+"""Small, fail-closed controller and UI for Codex usage-limit-reset one-shot jobs.
 
-The manager is deliberately incapable of redeeming a credit.  It may inspect the
+The manager is deliberately incapable of using a reset.  It may inspect the
 account through the guard's read-only compatibility probe, disarm an existing
 one-shot job, and ask the installer to create another one-shot job.
 """
@@ -32,7 +32,7 @@ from typing import Any, Callable, Mapping, Protocol, Sequence
 
 
 UTC = timezone.utc
-APP_VERSION = "2.2.0"
+APP_VERSION = "2.3.0"
 POLICY_SCHEMA_VERSION = 1
 MINIMUM_SCHEDULE_MARGIN_SECONDS = 600
 TASK_START_LEAD_SECONDS = 345
@@ -1315,7 +1315,7 @@ class NativeTrayIcon:
             data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
             data.uCallbackMessage = TRAY_CALLBACK
             data.hIcon = user32.LoadIconW(None, ctypes.c_void_p(32512))  # IDI_APPLICATION
-            data.szTip = "Codex Reset Credit Manager"
+            data.szTip = "Codex Usage Limit Reset Manager"
             if not self._register_notify_icon(shell32, data):
                 return False
             icon_data = data
@@ -1386,7 +1386,7 @@ class NativeTrayIcon:
             hwnd = user32.CreateWindowExW(
                 0,
                 class_name,
-                "Codex Reset Credit Tray",
+                "Codex Usage Limit Reset Manager Tray",
                 0,
                 0,
                 0,
@@ -1640,7 +1640,7 @@ class Controller:
             policy["blocked"] = {"code": code, "atUtc": _utc_text(self.now())}
             self._notify_once(
                 f"block:{code}",
-                "Codex Reset Credit Needs Attention",
+                "Codex Usage Limit Reset Needs Attention",
                 "Automatic scheduling was stopped because a safety check needs attention.",
                 "warning",
             )
@@ -1750,8 +1750,8 @@ class Controller:
         if job.state == "SUCCEEDED":
             self._notify_once(
                 f"terminal:{job.job_id}:SUCCEEDED",
-                "Codex Usage Reset Complete",
-                f"The reset credit expiring at {_local_time(job.expires_at)} was used safely.",
+                "Codex Usage Limit Reset Used",
+                f"The usage limit reset expiring at {_local_time(job.expires_at)} was used safely.",
             )
             return current is None
         if job.state in {"NO_ACTION", "INDETERMINATE"} or (
@@ -1761,8 +1761,8 @@ class Controller:
             level = "warning" if job.state == "NO_ACTION" else "error"
             self._notify_once(
                 f"terminal:{job.job_id}:{job.state}:{job.failure_code}",
-                "Codex Reset Credit Result",
-                "This credit will not be retried. Automation will continue after it expires.",
+                "Codex Usage Limit Reset Result",
+                "This reset will not be retried. Automation will continue after it expires.",
                 level,
             )
             return self.now() >= job.expires_at and current is None
@@ -1811,7 +1811,7 @@ class Controller:
         policy["currentJob"] = self._current_ref(child)
         self._notify_once(
             f"scheduled:{child.job_id}",
-            "Codex Reset Credit Scheduled",
+            "Codex Usage Limit Reset Scheduled",
             f"Automatic use is scheduled for {_local_time(child.process_at)}.",
         )
         self._log("scheduled", expiresAtUtc=_utc_text(child.expires_at))
@@ -2051,7 +2051,7 @@ class Controller:
             self._save_policy(policy)
             self._notify_once(
                 "paused",
-                "Codex Reset Credit Manager",
+                "Codex Usage Limit Reset Manager",
                 "Automatic use has been paused.",
             )
             return self._status_from(policy, current, time_state="unknown")
@@ -2156,8 +2156,8 @@ ERROR_MESSAGES = {
     "TIME_NOT_SYNCHRONIZED": "Windows time is not synchronized.",
     "MULTIPLE_ACTIVE_JOBS": "Multiple active jobs were found, so automation stopped safely.",
     "TASK_CONTRACT_INVALID": "The Scheduled Task configuration has changed.",
-    "INSUFFICIENT_LEAD_TIME": "There is not enough time left to schedule this credit safely.",
-    "LIVE_DISPATCH_ACTIVE": "A reset job is currently running. Try again shortly.",
+    "INSUFFICIENT_LEAD_TIME": "There is not enough time left to schedule this reset safely.",
+    "LIVE_DISPATCH_ACTIVE": "A usage limit reset is being used now. Try again shortly.",
     "CONTROLLER_BUSY": "Another manager check is already running.",
 }
 
@@ -2170,7 +2170,7 @@ def _human_status(status: Mapping[str, Any]) -> str:
     expires = status.get("nextExpiresAtUtc")
     process = status.get("nextProcessAtUtc")
     if isinstance(expires, str):
-        lines.append(f"Next credit expires: {_local_time(_utc_epoch(expires))}")
+        lines.append(f"Next reset expires: {_local_time(_utc_epoch(expires))}")
     if isinstance(process, str):
         lines.append(f"Automatic use scheduled: {_local_time(_utc_epoch(process))}")
     cli_text = {
@@ -2235,7 +2235,7 @@ def run_ui(controller: Controller) -> int:
     tray: NativeTrayIcon | None = None
     try:
         root = tk.Tk()
-        root.title("Codex Reset Credit Manager")
+        root.title("Codex Usage Limit Reset Manager")
         root.geometry("600x430")
         root.minsize(560, 400)
         root.configure(background="#FFFFFF")
@@ -2284,13 +2284,13 @@ def run_ui(controller: Controller) -> int:
         frame.pack(fill="both", expand=True)
         title = ttk.Label(
             frame,
-            text="Codex Reset Credit Manager",
+            text="Codex Usage Limit Reset Manager",
             style="Manager.Title.TLabel",
         )
         title.pack(anchor="w")
         subtitle = ttk.Label(
             frame,
-            text="Safely uses one selected reset credit about five minutes before it expires.",
+            text="Safely uses one selected usage limit reset about five minutes before it expires.",
             style="Manager.Subtitle.TLabel",
             wraplength=520,
         )
@@ -2302,7 +2302,7 @@ def run_ui(controller: Controller) -> int:
         }
         labels = (
             ("Automatic use", "automation"),
-            ("Next credit expires", "expires"),
+            ("Next reset expires", "expires"),
             ("Scheduled use", "process"),
             ("Codex CLI", "cli"),
             ("Windows time", "clock"),
@@ -2587,7 +2587,7 @@ def run_ui(controller: Controller) -> int:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Codex reset-credit automatic-use manager")
+    parser = argparse.ArgumentParser(description="Manage automatic use of Codex usage limit resets")
     parser.add_argument("--version", action="version", version=f"%(prog)s {APP_VERSION}")
     parser.add_argument("--root", type=Path, help=argparse.SUPPRESS)
     commands = parser.add_subparsers(dest="command", required=True)

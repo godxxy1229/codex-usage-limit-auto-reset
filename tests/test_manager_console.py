@@ -81,6 +81,28 @@ class ManagerConsoleOutputTests(unittest.TestCase):
             "Automatic use: On\nCodex CLI: Needs attention\nWindows time: Needs attention\n",
         )
 
+    def test_console_status_uses_reset_terminology(self) -> None:
+        self.controller.bootstrap_status.return_value = {
+            "automation": "on",
+            "nextExpiresAtUtc": "2030-01-01T01:00:00Z",
+        }
+        output = io.StringIO()
+
+        with mock.patch.object(manager.sys, "stdout", output):
+            exit_code = self.run_main(["status"])
+
+        self.assertEqual(exit_code, 0)
+        expected_time = manager._local_time(manager._utc_epoch("2030-01-01T01:00:00Z"))
+        self.assertIn(f"Next reset expires: {expected_time}", output.getvalue())
+        self.assertNotIn("credit", output.getvalue().casefold())
+
+    def test_cli_help_uses_usage_limit_reset_product_name(self) -> None:
+        self.assertEqual(manager.APP_VERSION, "2.3.0")
+        self.assertEqual(
+            manager._build_parser().description,
+            "Manage automatic use of Codex usage limit resets",
+        )
+
     def test_console_error_output_is_preserved(self) -> None:
         self.controller.sync.side_effect = manager.ManagerError("CONTROLLER_BUSY")
         output = io.StringIO()

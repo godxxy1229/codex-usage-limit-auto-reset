@@ -454,22 +454,36 @@ class InstallerSourceContractTests(unittest.TestCase):
         )
         self.assertIn("-Trigger @($logonTrigger, $periodicTrigger)", source)
 
-    def test_english_shortcut_is_verified_before_exact_legacy_removal(self) -> None:
+    def test_usage_limit_reset_shortcut_is_verified_before_exact_prior_removals(self) -> None:
         source = INSTALLER_SOURCE.read_text(encoding="utf-8")
-        english_name = "$ManagerShortcutName = 'Codex Reset Credit Manager.lnk'"
+        manager_name = "$ManagerShortcutName = 'Codex Usage Limit Reset Manager.lnk'"
+        current_name = "$CurrentManagerShortcutName = 'Codex Reset Credit Manager.lnk'"
         legacy_name = "$LegacyManagerShortcutName = 'Codex 초기화권 자동 사용.lnk'"
-        self.assertIn(english_name, source)
+        self.assertIn(manager_name, source)
+        self.assertIn(current_name, source)
         self.assertIn(legacy_name, source)
         create = source.index("Set-AndAssertManagerShortcut `", source.index("$shortcutPath ="))
         verified = source.index("$shortcutVerified = $true", create)
-        verify_end = source.index("if ($PSCmdlet.ShouldProcess('Codex Reset Credit Manager'", create)
-        remove = source.index("Remove-Item -LiteralPath $legacyShortcutPath -Force", verify_end)
+        verify_end = source.index("if ($PSCmdlet.ShouldProcess('Codex Usage Limit Reset Manager'", create)
+        remove_current = source.index(
+            "Remove-Item -LiteralPath $currentShortcutPath -Force", verify_end
+        )
+        remove_legacy = source.index(
+            "Remove-Item -LiteralPath $legacyShortcutPath -Force", remove_current
+        )
         self.assertLess(create, verify_end)
         self.assertLess(create, verified)
-        self.assertLess(verified, remove)
-        self.assertIn("if ($shortcutVerified -and", source[verify_end:remove])
+        self.assertLess(verified, remove_current)
+        self.assertLess(remove_current, remove_legacy)
+        self.assertIn("if ($shortcutVerified -and", source[verify_end:remove_current])
+        self.assertIn("if ($shortcutVerified -and", source[remove_current:remove_legacy])
         self.assertIn("$readback.Description -ne $shortcutDescription", source)
-        self.assertLess(verify_end, remove)
+        self.assertIn(
+            "$shortcutDescription = 'Manage automatic use of Codex usage limit resets'",
+            source,
+        )
+        self.assertLess(verify_end, remove_current)
+        self.assertNotIn("Remove-Item -Path $currentShortcutPath", source)
         self.assertNotIn("Remove-Item -Path $legacyShortcutPath", source)
         self.assertNotIn("*Codex*", source)
 
@@ -546,6 +560,7 @@ class InstallerSourceContractTests(unittest.TestCase):
             source.index("$policySnapshot = Get-FileByteSnapshot", normal),
             source.index("$managerTaskSnapshot = Get-ManagerTaskSnapshot", normal),
             source.index("$shortcutSnapshot = Get-FileByteSnapshot", normal),
+            source.index("$currentShortcutSnapshot = Get-FileByteSnapshot", normal),
             source.index("$legacyShortcutSnapshot = Get-FileByteSnapshot", normal),
             source.index("$priorManagerUis = @(", normal),
         )
@@ -560,12 +575,14 @@ class InstallerSourceContractTests(unittest.TestCase):
         restore_policy = source.index("Restore-FileByteSnapshot -Path $policyPath", catch)
         restore_task = source.index("Restore-ManagerTaskSnapshot -Snapshot $managerTaskSnapshot", catch)
         restore_shortcut = source.index("Restore-FileByteSnapshot -Path $shortcutPath", catch)
+        restore_current = source.index("Restore-FileByteSnapshot -Path $currentShortcutPath", catch)
         restore_legacy = source.index("Restore-FileByteSnapshot -Path $legacyShortcutPath", catch)
         relaunch = source.index("-FilePath $previous.Pythonw", catch)
         self.assertLess(stop_replacement, restore_policy)
         self.assertLess(restore_policy, restore_task)
         self.assertLess(restore_task, restore_shortcut)
-        self.assertLess(restore_shortcut, restore_legacy)
+        self.assertLess(restore_shortcut, restore_current)
+        self.assertLess(restore_current, restore_legacy)
         self.assertLess(restore_legacy, relaunch)
 
     def test_active_one_shot_and_controller_locks_guard_the_commit(self) -> None:
@@ -632,25 +649,44 @@ class InstallerSourceContractTests(unittest.TestCase):
         suspend = source.index("Suspend-ManagerSyncForInstall -Snapshot", transaction)
         policy_attempt = source.index("$policyMutationAttempted = $true", suspend)
         status = source.index("$managerStatus = Invoke-Manager", policy_attempt)
-        english_attempt = source.index("$englishShortcutMutationAttempted = $true", status)
-        english_write = source.index("Set-AndAssertManagerShortcut `", english_attempt)
-        legacy_attempt = source.index("$legacyShortcutMutationAttempted = $true", english_write)
+        manager_attempt = source.index("$managerShortcutMutationAttempted = $true", status)
+        manager_write = source.index("Set-AndAssertManagerShortcut `", manager_attempt)
+        current_attempt = source.index("$currentShortcutMutationAttempted = $true", manager_write)
+        current_remove = source.index(
+            "Remove-Item -LiteralPath $currentShortcutPath", current_attempt
+        )
+        legacy_attempt = source.index("$legacyShortcutMutationAttempted = $true", current_remove)
         legacy_remove = source.index("Remove-Item -LiteralPath $legacyShortcutPath", legacy_attempt)
         self.assertLess(suspend, policy_attempt)
         self.assertLess(policy_attempt, status)
-        self.assertLess(english_attempt, english_write)
+        self.assertLess(manager_attempt, manager_write)
+        self.assertLess(current_attempt, current_remove)
+        self.assertLess(current_remove, legacy_attempt)
         self.assertLess(legacy_attempt, legacy_remove)
 
         catch = source.index("$installationError = $_", legacy_remove)
         policy_guard = source.index("if ($policyMutationAttempted)", catch)
         policy_restore = source.index("Restore-FileByteSnapshot -Path $policyPath", policy_guard)
-        english_guard = source.index("if ($englishShortcutMutationAttempted)", policy_restore)
-        english_restore = source.index("Restore-FileByteSnapshot -Path $shortcutPath", english_guard)
-        legacy_guard = source.index("if ($legacyShortcutMutationAttempted)", english_restore)
+        manager_guard = source.index("if ($managerShortcutMutationAttempted)", policy_restore)
+        manager_restore = source.index("Restore-FileByteSnapshot -Path $shortcutPath", manager_guard)
+        current_guard = source.index("if ($currentShortcutMutationAttempted)", manager_restore)
+        current_restore = source.index(
+            "Restore-FileByteSnapshot -Path $currentShortcutPath", current_guard
+        )
+        legacy_guard = source.index("if ($legacyShortcutMutationAttempted)", current_restore)
         legacy_restore = source.index("Restore-FileByteSnapshot -Path $legacyShortcutPath", legacy_guard)
         self.assertLess(policy_guard, policy_restore)
-        self.assertLess(english_guard, english_restore)
+        self.assertLess(manager_guard, manager_restore)
+        self.assertLess(current_guard, current_restore)
         self.assertLess(legacy_guard, legacy_restore)
+
+    def test_compatibility_paths_and_schema_facing_names_remain_stable(self) -> None:
+        source = INSTALLER_SOURCE.read_text(encoding="utf-8")
+        self.assertIn("$TaskFolder = '\\CodexResetCredit\\'", source)
+        self.assertIn("Join-Path $env:LOCALAPPDATA 'CodexResetCredit'", source)
+        self.assertIn('("reset-credit-{0}.json"', source)
+        self.assertIn("'target.creditIdSha256'", source)
+        self.assertIn("$CodexPathEnvironmentVariable = 'CODEX_RESET_GUARD_CODEX_PATH'", source)
 
     def test_policy_rollback_requires_held_or_reacquired_controller_lock(self) -> None:
         source = INSTALLER_SOURCE.read_text(encoding="utf-8")
@@ -787,7 +823,7 @@ class InstallerRollbackHelperTests(unittest.TestCase):
         self.assertEqual(list(self.root.glob("*.rollback-*.tmp")), [])
 
     def test_file_created_after_absent_snapshot_is_removed(self) -> None:
-        path = self.root / "Codex Reset Credit Manager.lnk"
+        path = self.root / "Codex Usage Limit Reset Manager.lnk"
         completed = self.invoke_file_rollback(path)
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertFalse(path.exists())

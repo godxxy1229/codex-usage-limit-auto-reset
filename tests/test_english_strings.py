@@ -32,6 +32,23 @@ AUDITED_FILES = (
     "README.md",
 )
 
+OLD_USER_FACING_TERMS = (
+    "Codex Reset Credit Manager",
+    "Auto-redeem",
+    "Exact credit",
+)
+
+USER_FACING_TERMINOLOGY_FILES = AUDITED_FILES + (
+    "README.ko.md",
+    "docs/images/social-preview.svg",
+)
+
+# Retired names may remain only as exact migration identifiers. Technical RPC
+# and schema names such as ``creditId`` are intentionally outside this audit.
+ALLOWED_RETIRED_LITERALS = {
+    "install.ps1": ("'Codex Reset Credit Manager.lnk'",),
+}
+
 
 class EnglishUserFacingStringsTests(unittest.TestCase):
     def test_only_explicit_functional_korean_literals_remain(self) -> None:
@@ -60,6 +77,31 @@ class EnglishUserFacingStringsTests(unittest.TestCase):
                 count,
                 1,
                 f"Functional allowlisted literal must appear exactly once: {relative_path}: {literal}",
+            )
+
+    def test_retired_product_terms_do_not_return_to_user_facing_text(self) -> None:
+        found_allowed: dict[tuple[str, str], int] = {}
+        for relative_path in USER_FACING_TERMINOLOGY_FILES:
+            path = ROOT / relative_path
+            text = path.read_text(encoding="utf-8-sig")
+            for literal in ALLOWED_RETIRED_LITERALS.get(relative_path, ()):
+                count = text.count(literal)
+                found_allowed[(relative_path, literal)] = count
+                text = text.replace(literal, "")
+            for term in OLD_USER_FACING_TERMS:
+                self.assertNotIn(term, text, f"Retired product term in {path}: {term}")
+
+        self.assertNotIn(
+            "초기화권",
+            (ROOT / "README.ko.md").read_text(encoding="utf-8-sig"),
+            "The Korean guide should use the ChatGPT usage-limit terminology",
+        )
+
+        for (relative_path, literal), count in found_allowed.items():
+            self.assertEqual(
+                count,
+                1,
+                f"Retired migration literal must appear exactly once: {relative_path}: {literal}",
             )
 
 
