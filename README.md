@@ -1,8 +1,12 @@
 # Codex Reset Credit Manager
 
-Codex Reset Credit Manager is a Windows utility that safely consumes one selected Codex reset credit about five minutes before it expires. After installation, open the small manager window from the Start Menu and select **Start Automatic Use** once.
+Codex Reset Credit Manager is a community-built Windows automation tool that automatically redeems (consumes) one selected OpenAI Codex reset credit about five minutes before it expires. It combines Python and PowerShell scripts, Windows Task Scheduler, and the local Codex CLI app-server with fail-closed exact-credit checks. After installation, open the small manager window from the Start Menu and select **Start Automatic Use** once.
 
 Korean documentation is available in [README.ko.md](README.ko.md).
+
+![Codex Reset Credit Manager window showing automatic use enabled and a scheduled reset credit](docs/images/manager-ui-example.svg)
+
+*Manager UI shown with synthetic example data.*
 
 ## Quick start
 
@@ -12,6 +16,10 @@ Korean documentation is available in [README.ko.md](README.ko.md).
 4. Confirm that the window shows **Automatic use: On** and a scheduled-use time.
 
 The installer asks for UAC permission only when Windows Time must be synchronized with `time.windows.com`. If time synchronization is already healthy, no UAC prompt is needed.
+
+## Reset credits, quota, and tokens
+
+In this project, **redeem** is a user-facing term for consuming an existing reset credit through the supported local Codex app-server contract. The tool does not reset or increase Codex quota, generate quota-reset tokens, read `auth.json`, or call the backend API directly.
 
 ## Closing and reopening the manager
 
