@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.coverage
+.pytest_cache/
+*.log
+*.lock
+*manifest*.json
+*.jsonl
+*.json.cancel
+policy.json
+notifications.json
+manager-ui-*.json
+state/
+manifests/
+logs/
+runners/
+installers/
