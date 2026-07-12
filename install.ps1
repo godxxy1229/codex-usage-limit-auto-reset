@@ -19,8 +19,9 @@ service. Use -ConfigureWindowsTime to permit a narrowly scoped UAC repair only
 when verification fails.  -InteractiveSetup explains the problem and asks
 before showing the same UAC prompt.
 
--WhatIf discovers and validates local prerequisites, but does not copy files,
-invoke Python, configure time, register a task, create a shortcut, or open UI.
+-WhatIf discovers and validates local prerequisites, including read-only
+Python and Codex probes, but does not invoke the guard or app-server, copy
+files, configure time, register a task, create a shortcut, or open UI.
 #>
 
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
@@ -119,60 +120,283 @@ function Resolve-CanonicalFile {
     return [IO.Path]::GetFullPath($resolved.Path)
 }
 
-function Get-Python313 {
-    param([string] $RequestedPath)
+function Get-PythonRuntimeProbe {
+    param([Parameter(Mandatory)][string] $Path)
 
-    $candidates = [Collections.Generic.List[string]]::new()
+    # Keep this probe isolated from user site packages and emit one JSON value.
+    # Py_GIL_DISABLED identifies the build, unlike sys._is_gil_enabled(), whose
+    # value may change at runtime after importing an extension.
+    $probeCode = @'
+import json, platform, subprocess, sys, sysconfig
+capabilities = {}
+checks = {
+    "tkinterTtk": "import tkinter; import tkinter.ttk",
+    "ctypesWindows": "import ctypes; import ctypes.wintypes; assert hasattr(ctypes, 'WINFUNCTYPE')",
+    "msvcrt": "import msvcrt",
+    "createNoWindow": "import subprocess; assert hasattr(subprocess, 'CREATE_NO_WINDOW')",
+}
+for name, code in checks.items():
+    try:
+        exec(code, {})
+        capabilities[name] = True
+    except Exception:
+        capabilities[name] = False
+print(json.dumps({
+    "implementation": platform.python_implementation(),
+    "major": sys.version_info.major,
+    "minor": sys.version_info.minor,
+    "micro": sys.version_info.micro,
+    "releaselevel": sys.version_info.releaselevel,
+    "executable": sys.executable,
+    "baseInstallation": sys.prefix == sys.base_prefix and sys.exec_prefix == sys.base_exec_prefix,
+    "gilDisabledBuild": bool(sysconfig.get_config_var("Py_GIL_DISABLED") or 0),
+    "capabilities": capabilities,
+}, separators=(",", ":")))
+'@
+    $lines = @(& $Path -I -c $probeCode 2>$null)
+    if ($LASTEXITCODE -ne 0 -or $lines.Count -ne 1 -or
+        [string]::IsNullOrWhiteSpace([string] $lines[0])) {
+        throw 'Python capability probe failed.'
+    }
+    try { return ([string] $lines[0] | ConvertFrom-Json -Depth 20) }
+    catch { throw 'Python capability probe returned invalid JSON.' }
+}
+
+function ConvertTo-CompatiblePythonRuntime {
+    param(
+        [Parameter(Mandatory)][string] $Path,
+        [Parameter(Mandatory)][object] $Probe
+    )
+
+    $candidate = Resolve-CanonicalFile -Path $Path -Description 'Python executable'
+    if ([IO.Path]::GetFileName($candidate) -ine 'python.exe') {
+        throw 'The Python runtime must identify python.exe.'
+    }
+    $candidateItem = Get-Item -LiteralPath $candidate -Force -ErrorAction Stop
+    if (($candidateItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw 'The Python runtime must be a real python.exe file, not a redirected link.'
+    }
+    if ($candidate -match '(?i)[\\/]Microsoft[\\/]WindowsApps[\\/]') {
+        throw 'Microsoft WindowsApps Python execution aliases are not supported.'
+    }
+    if ([string] $Probe.implementation -cne 'CPython') {
+        throw 'The Python runtime must be CPython.'
+    }
+    $major = 0
+    $minor = 0
+    $micro = 0
+    if (-not [int]::TryParse([string] $Probe.major, [ref] $major) -or
+        -not [int]::TryParse([string] $Probe.minor, [ref] $minor) -or
+        -not [int]::TryParse([string] $Probe.micro, [ref] $micro) -or
+        $major -ne 3 -or $minor -lt 11) {
+        throw 'A final CPython 3.11 or newer runtime is required.'
+    }
+    if ([string] $Probe.releaselevel -cne 'final') {
+        throw 'Prerelease Python runtimes are not supported.'
+    }
+    if ($Probe.baseInstallation -isnot [bool] -or -not [bool] $Probe.baseInstallation) {
+        throw 'Virtual environments are not supported; use a base CPython installation.'
+    }
+    if ($Probe.gilDisabledBuild -isnot [bool] -or [bool] $Probe.gilDisabledBuild) {
+        throw 'Free-threaded CPython builds are not supported.'
+    }
+    $probedExecutable = Resolve-CanonicalFile -Path ([string] $Probe.executable) -Description 'Probed Python executable'
+    if (-not [StringComparer]::OrdinalIgnoreCase.Equals($candidate, $probedExecutable)) {
+        throw 'The Python executable resolved to a different runtime during validation.'
+    }
+    foreach ($capability in @('tkinterTtk', 'ctypesWindows', 'msvcrt', 'createNoWindow')) {
+        $property = $Probe.capabilities.PSObject.Properties[$capability]
+        if ($null -eq $property -or $property.Value -isnot [bool] -or -not [bool] $property.Value) {
+            throw "The Python runtime is missing required capability: $capability."
+        }
+    }
+    $pythonw = Join-Path ([IO.Path]::GetDirectoryName($candidate)) 'pythonw.exe'
+    if (-not (Test-Path -LiteralPath $pythonw -PathType Leaf)) {
+        throw 'The Python runtime has no sibling pythonw.exe.'
+    }
+    $pythonw = Resolve-CanonicalFile -Path $pythonw -Description 'Windowless Python executable'
+    $pythonwItem = Get-Item -LiteralPath $pythonw -Force -ErrorAction Stop
+    if ([IO.Path]::GetFileName($pythonw) -ine 'pythonw.exe' -or
+        -not [StringComparer]::OrdinalIgnoreCase.Equals(
+            [IO.Path]::GetDirectoryName($candidate),
+            [IO.Path]::GetDirectoryName($pythonw)
+        ) -or
+        ($pythonwItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw 'The windowless runtime must be a real sibling pythonw.exe file in the same installation directory.'
+    }
+    return [pscustomobject]@{
+        Path = $candidate
+        WindowlessPath = $pythonw
+        Version = "$major.$minor.$micro"
+        VersionObject = [version] "$major.$minor.$micro"
+    }
+}
+
+function Get-CompatiblePythonRuntime {
+    param([Parameter(Mandatory)][string] $Path)
+
+    $candidate = Resolve-CanonicalFile -Path $Path -Description 'Python executable'
+    # Reject execution aliases and redirected files before invoking anything.
+    # In particular, launching a WindowsApps alias could offer to install a
+    # runtime, which discovery and validation must never trigger.
+    if ([IO.Path]::GetFileName($candidate) -ine 'python.exe') {
+        throw 'The Python runtime must identify python.exe.'
+    }
+    if ($candidate -match '(?i)[\\/]Microsoft[\\/]WindowsApps[\\/]') {
+        throw 'Microsoft WindowsApps Python execution aliases are not supported.'
+    }
+    $candidateItem = Get-Item -LiteralPath $candidate -Force -ErrorAction Stop
+    if (($candidateItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw 'The Python runtime must be a real python.exe file, not a redirected link.'
+    }
+    $probe = Get-PythonRuntimeProbe -Path $candidate
+    return ConvertTo-CompatiblePythonRuntime -Path $candidate -Probe $probe
+}
+
+function Get-InstalledPythonCandidates {
+    $result = [Collections.Generic.List[string]]::new()
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $launcher = Get-Command py.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -ne $launcher -and -not [string]::IsNullOrWhiteSpace([string] $launcher.Source)) {
+        # -0p only lists installed runtimes. Never use a version selector here:
+        # newer launchers may install a missing runtime in response to one.
+        $listed = & $launcher.Source -0p 2>$null
+        if ($LASTEXITCODE -eq 0) {
+            foreach ($line in @($listed)) {
+                $match = [regex]::Match(
+                    [string] $line,
+                    '(?i)(?<path>[A-Z]:[\\/].*[\\/]python\.exe)(?:\s+\*)?\s*$'
+                )
+                if ($match.Success -and (Test-Path -LiteralPath $match.Groups['path'].Value -PathType Leaf)) {
+                    $fullPath = [IO.Path]::GetFullPath($match.Groups['path'].Value)
+                    if ($seen.Add($fullPath)) { $result.Add($fullPath) }
+                }
+            }
+        }
+    }
+    foreach ($command in @(Get-Command python.exe -All -ErrorAction SilentlyContinue)) {
+        if (-not [string]::IsNullOrWhiteSpace([string] $command.Source) -and
+            (Test-Path -LiteralPath $command.Source -PathType Leaf)) {
+            $fullPath = [IO.Path]::GetFullPath($command.Source)
+            if ($seen.Add($fullPath)) { $result.Add($fullPath) }
+        }
+    }
+    return @($result)
+}
+
+function ConvertFrom-PythonTaskCommand {
+    param(
+        [Parameter(Mandatory)][string] $Command,
+        [Parameter(Mandatory)][string] $Description
+    )
+
+    $resolved = Resolve-CanonicalFile -Path $Command -Description "$Description action command"
+    $name = [IO.Path]::GetFileName($resolved)
+    if ($name -ieq 'pythonw.exe') {
+        $resolved = Join-Path ([IO.Path]::GetDirectoryName($resolved)) 'python.exe'
+    }
+    elseif ($name -ine 'python.exe') {
+        throw "$Description does not use python.exe or pythonw.exe."
+    }
+    return Resolve-CanonicalFile -Path $resolved -Description "$Description Python runtime"
+}
+
+function Get-ManagerPythonRuntimeHint {
+    $managerTask = Get-ScheduledTask -TaskName $ManagerTaskName -TaskPath $TaskFolder -ErrorAction SilentlyContinue
+    if ($null -eq $managerTask) { return $null }
+    if (@($managerTask).Count -ne 1) { throw 'ManagerSync resolved more than one scheduled task.' }
+    $managerXmlText = [string] (Export-ScheduledTask -TaskName $ManagerTaskName -TaskPath $TaskFolder -ErrorAction Stop)
+    if ([string]::IsNullOrWhiteSpace($managerXmlText)) { throw 'ManagerSync exported an empty task definition.' }
+    try { [xml] $managerXml = $managerXmlText }
+    catch { throw 'ManagerSync exported invalid task XML.' }
+    $managerCommand = Get-RequiredXmlText `
+        $managerXml `
+        "/*[local-name()='Task']/*[local-name()='Actions']/*[local-name()='Exec']/*[local-name()='Command']" `
+        'ManagerSync action command'
+    return ConvertFrom-PythonTaskCommand -Command $managerCommand -Description 'ManagerSync'
+}
+
+function Get-ActivePythonRuntimeHint {
+    param([Parameter(Mandatory)][string] $ManifestDirectory)
+
+    $nonterminal = @(Get-ManifestInventory -Directory $ManifestDirectory | Where-Object { -not $_.Terminal })
+    if ($nonterminal.Count -gt 1) {
+        throw 'More than one nonterminal manifest exists. Resolve the conflict before selecting Python.'
+    }
+    if ($nonterminal.Count -eq 1) {
+        try { $manifest = Get-Content -Raw -LiteralPath $nonterminal[0].Path | ConvertFrom-Json -Depth 100 }
+        catch { throw 'The active manifest cannot be read while selecting Python.' }
+        $fullTaskName = [string] $manifest.task.name
+        $match = [regex]::Match($fullTaskName, '^\\CodexResetCredit\\(?<leaf>Consume-[^\\]+)$', [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+        if (-not $match.Success) { throw 'The active manifest does not identify an exact Consume task.' }
+        $taskXmlText = [string] (Export-ScheduledTask -TaskName $match.Groups['leaf'].Value -TaskPath $TaskFolder -ErrorAction Stop)
+        if ([string]::IsNullOrWhiteSpace($taskXmlText)) { throw 'The active Consume task exported empty XML.' }
+        $contract = Get-OneShotTaskContract -XmlText $taskXmlText
+        return ConvertFrom-PythonTaskCommand -Command $contract.Command -Description 'Active Consume task'
+    }
+    return $null
+}
+
+function Get-ExistingPythonRuntimeHints {
+    param([Parameter(Mandatory)][string] $ManifestDirectory)
+
+    return [pscustomobject]@{
+        ManagerPython = Get-ManagerPythonRuntimeHint
+        ActivePython = Get-ActivePythonRuntimeHint -ManifestDirectory $ManifestDirectory
+    }
+}
+
+function Select-CompatiblePythonRuntime {
+    param(
+        [string] $RequestedPath,
+        [Parameter(Mandatory)][string] $ManifestDirectory,
+        [switch] $ChildOnly
+    )
+
+    if ($ChildOnly -and [string]::IsNullOrWhiteSpace($RequestedPath)) {
+        throw '-ManagerChildOnly requires the controller to supply an explicit -PythonPath.'
+    }
     if (-not [string]::IsNullOrWhiteSpace($RequestedPath)) {
-        $candidates.Add((Resolve-CanonicalFile -Path $RequestedPath -Description 'Python executable'))
-    }
-    else {
-        $launcher = Get-Command py.exe -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($null -ne $launcher) {
-            $discovered = & $launcher.Source -3.13 -c 'import sys; print(sys.executable)' 2>$null
-            if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace(($discovered | Select-Object -First 1))) {
-                $candidate = ($discovered | Select-Object -First 1).Trim()
-                if (Test-Path -LiteralPath $candidate -PathType Leaf) {
-                    $candidates.Add([IO.Path]::GetFullPath($candidate))
-                }
-            }
+        $runtime = Get-CompatiblePythonRuntime -Path $RequestedPath
+        $activePython = if ($ChildOnly) { $null } else {
+            Get-ActivePythonRuntimeHint -ManifestDirectory $ManifestDirectory
         }
-
-        foreach ($command in @(Get-Command python.exe -All -ErrorAction SilentlyContinue)) {
-            if (-not [string]::IsNullOrWhiteSpace($command.Source) -and (Test-Path -LiteralPath $command.Source -PathType Leaf)) {
-                $fullPath = [IO.Path]::GetFullPath($command.Source)
-                if (-not $candidates.Contains($fullPath)) {
-                    $candidates.Add($fullPath)
-                }
-            }
+        if ($null -ne $activePython -and
+            -not [StringComparer]::OrdinalIgnoreCase.Equals(
+                [IO.Path]::GetDirectoryName($runtime.Path),
+                [IO.Path]::GetDirectoryName([string] $activePython)
+            )) {
+            throw 'An active one-shot uses a different Python installation; refusing a cross-directory runtime switch.'
         }
+        return $runtime
     }
 
-    foreach ($candidate in $candidates) {
-        try {
-            $versionText = & $candidate -c 'import platform; print(platform.python_version())' 2>$null
-            if ($LASTEXITCODE -ne 0) {
-                continue
-            }
-            $version = [version] (($versionText | Select-Object -First 1).Trim())
-            if ($version.Major -eq 3 -and $version.Minor -eq 13) {
-                $pythonw = Join-Path ([IO.Path]::GetDirectoryName($candidate)) 'pythonw.exe'
-                if (-not (Test-Path -LiteralPath $pythonw -PathType Leaf)) {
-                    continue
-                }
-                return [pscustomobject]@{
-                    Path    = $candidate
-                    WindowlessPath = [IO.Path]::GetFullPath($pythonw)
-                    Version = $version.ToString()
-                }
-            }
-        }
-        catch {
-            continue
-        }
+    $hints = Get-ExistingPythonRuntimeHints -ManifestDirectory $ManifestDirectory
+    if ($null -ne $hints.ActivePython -and $null -ne $hints.ManagerPython -and
+        -not [StringComparer]::OrdinalIgnoreCase.Equals(
+            [IO.Path]::GetDirectoryName([string] $hints.ActivePython),
+            [IO.Path]::GetDirectoryName([string] $hints.ManagerPython)
+        )) {
+        throw 'ManagerSync and the active one-shot do not share one Python installation.'
+    }
+    $sticky = if ($null -ne $hints.ActivePython) { $hints.ActivePython } else { $hints.ManagerPython }
+    if ($null -ne $sticky) {
+        try { return Get-CompatiblePythonRuntime -Path ([string] $sticky) }
+        catch { throw "The existing scheduled runtime is not a compatible base CPython 3.11+: $($_.Exception.Message)" }
     }
 
-    throw 'A working CPython 3.13 executable was not found. Supply -PythonPath explicitly.'
+    $valid = [Collections.Generic.List[object]]::new()
+    foreach ($candidate in @(Get-InstalledPythonCandidates)) {
+        try { $valid.Add((Get-CompatiblePythonRuntime -Path $candidate)) }
+        catch { continue }
+    }
+    if ($valid.Count -eq 0) {
+        throw 'A compatible final, GIL-enabled base CPython 3.11+ installation was not found. Supply -PythonPath explicitly.'
+    }
+    return @($valid | Sort-Object -Property @(
+        @{ Expression = { $_.VersionObject }; Descending = $true },
+        @{ Expression = { $_.Path }; Descending = $false }
+    ))[0]
 }
 
 function Get-NpmNativeCodex {
@@ -1181,6 +1405,24 @@ function Assert-ActiveOneShotTriggerMargin {
     }
 }
 
+function Assert-SelectedPythonMatchesActiveOneShot {
+    param(
+        [Parameter(Mandatory)][object] $PythonRuntime,
+        [Parameter(Mandatory)][object] $Snapshot
+    )
+
+    if (-not [bool] $Snapshot.Exists) { return }
+    $activePython = ConvertFrom-PythonTaskCommand `
+        -Command ([string] $Snapshot.Command) `
+        -Description 'Active Consume task snapshot'
+    if (-not [StringComparer]::OrdinalIgnoreCase.Equals(
+        [IO.Path]::GetDirectoryName([string] $PythonRuntime.Path),
+        [IO.Path]::GetDirectoryName([string] $activePython)
+    )) {
+        throw 'The selected Python installation differs from the active one-shot snapshot; refusing a cross-directory runtime switch.'
+    }
+}
+
 function Assert-ManagerTask {
     param(
         [Parameter(Mandatory)][string] $ExpectedUser,
@@ -1573,6 +1815,9 @@ Assert-WindowsPowerShell7
 if ($ManagerChildOnly -and [string]::IsNullOrWhiteSpace($CodexPath)) {
     throw '-ManagerChildOnly requires the controller to supply an explicit -CodexPath.'
 }
+if ($ManagerChildOnly -and [string]::IsNullOrWhiteSpace($PythonPath)) {
+    throw '-ManagerChildOnly requires the controller to supply an explicit -PythonPath.'
+}
 
 $installRoot = [IO.Path]::GetFullPath((Join-Path $env:LOCALAPPDATA 'CodexResetCredit'))
 $runnersDirectory = Join-Path $installRoot 'runners'
@@ -1606,7 +1851,10 @@ if ([IO.Path]::GetExtension($sourceRunnerPath) -ne '.py') {
 }
 $sourceRunnerHash = (Get-FileHash -LiteralPath $sourceRunnerPath -Algorithm SHA256).Hash.ToLowerInvariant()
 
-$python = Get-Python313 -RequestedPath $PythonPath
+$python = Select-CompatiblePythonRuntime `
+    -RequestedPath $PythonPath `
+    -ManifestDirectory $manifestsDirectory `
+    -ChildOnly:$ManagerChildOnly
 $codex = Get-NpmNativeCodex -RequestedPath $CodexPath
 $currentUser = [Security.Principal.WindowsIdentity]::GetCurrent().Name
 $runtimeRunner = Join-Path $runnersDirectory "codex_reset_guard-$sourceRunnerHash.py"
@@ -1649,7 +1897,7 @@ if ($WhatIfPreference) {
         $null = $PSCmdlet.ShouldProcess("$TaskFolder$ManagerTaskName", "Register and verify logon plus $ManagerSyncIntervalMinutes-minute controller task")
         $null = $PSCmdlet.ShouldProcess('Current-user Start Menu', 'Create and verify the usage limit reset manager shortcut, then remove the exact prior English and Korean shortcuts')
     }
-    Write-Host 'WhatIf complete. No Python command, file write, time change, task registration, shortcut, or GUI launch was performed.'
+    Write-Host 'WhatIf complete. Only read-only prerequisite probes ran; no guard/app-server, file write, time change, task registration, shortcut, or GUI launch was performed.'
     return
 }
 
@@ -1768,6 +2016,9 @@ if (-not $ManagerChildOnly) {
     $activeOneShotSnapshot = Get-ActiveOneShotSnapshot `
         -NonterminalInventory $nonterminal `
         -ManifestDirectory $manifestsDirectory
+    Assert-SelectedPythonMatchesActiveOneShot `
+        -PythonRuntime $python `
+        -Snapshot $activeOneShotSnapshot
 
     $programsDirectory = [Environment]::GetFolderPath([Environment+SpecialFolder]::Programs)
     if ([string]::IsNullOrWhiteSpace($programsDirectory)) { throw 'Current-user Start Menu directory is unavailable.' }
@@ -1819,6 +2070,9 @@ if (-not $ManagerChildOnly) {
             -Path (Join-Path $stateDirectory 'controller.lock') `
             -Description 'controller.lock for UI quiescence'
         Assert-ActiveOneShotUnchanged -Snapshot $activeOneShotSnapshot
+        Assert-SelectedPythonMatchesActiveOneShot `
+            -PythonRuntime $python `
+            -Snapshot $activeOneShotSnapshot
 
         # Stop only verified, content-addressed manager UI processes beneath
         # this user's install root. This prevents a stale UI from restoring

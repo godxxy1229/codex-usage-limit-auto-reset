@@ -17,15 +17,19 @@ Korean documentation is available in [README.ko.md](README.ko.md).
 Requirements:
 
 - Windows with PowerShell 7 (`pwsh.exe`)
-- CPython 3.13 with `python.exe` and `pythonw.exe` in the same directory
+- A final-release, GIL-enabled base installation of CPython 3.11 or later, with sibling `python.exe` and `pythonw.exe`
 - A global npm installation of Codex CLI `0.144.1` or later
 - A signed-in Codex CLI account
+
+CPython 3.10, prereleases, free-threaded builds, PyPy, virtual environments, and WindowsApps aliases are not supported. Future final CPython 3.x releases are accepted only when the same built-in capability checks pass; the installer never downloads Python.
 
 1. Double-click `setup.cmd`.
 2. In the manager window, select **Start Automatic Use**.
 3. Check for **Automatic use: On** and a scheduled-use time.
 
 New installations start paused. UAC is requested only when Windows Time needs synchronization with `time.windows.com`; a healthy clock needs no prompt.
+
+The installer pins scheduled tasks to the selected Python executable's absolute path. Keep that Python installation in place; removing or moving it stops the manager and one-shot tasks until the tool is reinstalled with a compatible runtime.
 
 ## How it works
 

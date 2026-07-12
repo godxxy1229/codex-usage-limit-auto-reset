@@ -97,7 +97,7 @@ class ManagerConsoleOutputTests(unittest.TestCase):
         self.assertNotIn("credit", output.getvalue().casefold())
 
     def test_cli_help_uses_usage_limit_reset_product_name(self) -> None:
-        self.assertEqual(manager.APP_VERSION, "2.3.0")
+        self.assertEqual(manager.APP_VERSION, "2.4.0")
         self.assertEqual(
             manager._build_parser().description,
             "Manage automatic use of Codex usage limit resets",

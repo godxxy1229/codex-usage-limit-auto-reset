@@ -71,7 +71,6 @@ class AppServerTransportTests(unittest.TestCase):
 
     def test_dropped_consume_times_out_then_replays_with_new_rpc_id(self) -> None:
         transport = self.transport(
-            timeout=0.25,
             env={
                 "FAKE_DROP_CONSUME_RESPONSES": "1",
                 "FAKE_REQUIRE_STABLE_REPLAY": "1",
@@ -83,7 +82,7 @@ class AppServerTransportTests(unittest.TestCase):
         params = build_consume_params("fake-credit-id", IDEMPOTENCY_KEY)
 
         with self.assertRaises(TransportError) as raised:
-            transport.request(CONSUME_METHOD, params)
+            transport.request(CONSUME_METHOD, params, timeout=0.25)
         self.assertTrue(raised.exception.after_write)
 
         # The fake rejects changed replay parameters.  A successful second

@@ -159,5 +159,93 @@ class ManagerTaskPythonContractTests(unittest.TestCase):
         run.assert_called_once()
 
 
+class ManagerChildPythonContractTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name).resolve()
+        self.runtime_dir = self.root / "python"
+        self.runtime_dir.mkdir()
+        self.python = self.runtime_dir / "python.exe"
+        self.pythonw = self.runtime_dir / "pythonw.exe"
+        self.python.write_bytes(b"")
+        self.pythonw.write_bytes(b"")
+        self.installer = self.root / "install.ps1"
+        self.installer.write_text("# test installer\n", encoding="utf-8")
+        self.services = manager.RealServices(self.root)
+
+    def invoke(self, executable: Path) -> mock.Mock:
+        completed = SimpleNamespace(
+            returncode=0,
+            stdout='{"jobId":"test-job"}\n',
+            stderr="",
+        )
+        with (
+            mock.patch.object(manager.sys, "executable", str(executable)),
+            mock.patch.object(manager.shutil, "which", return_value=r"C:\Program Files\PowerShell\7\pwsh.exe"),
+            mock.patch.object(manager.subprocess, "run", return_value=completed) as run,
+        ):
+            result = self.services.create_child(
+                self.installer,
+                r"C:\codex\codex.exe",
+                None,
+            )
+        self.assertEqual(result, {"jobId": "test-job"})
+        return run
+
+    def assert_exact_console_python(self, run: mock.Mock) -> None:
+        command = run.call_args.args[0]
+        self.assertEqual(command.count("-PythonPath"), 1)
+        index = command.index("-PythonPath")
+        self.assertEqual(command[index + 1], str(self.python.resolve()))
+        self.assertEqual(
+            run.call_args.kwargs["creationflags"],
+            manager.WINDOWLESS_SUBPROCESS_FLAGS,
+        )
+
+    def test_windowless_manager_passes_exact_sibling_console_python(self) -> None:
+        self.assert_exact_console_python(self.invoke(self.pythonw))
+
+    def test_console_manager_passes_its_exact_console_python(self) -> None:
+        self.assert_exact_console_python(self.invoke(self.python))
+
+    def test_missing_sibling_pythonw_is_rejected_before_child_process(self) -> None:
+        self.pythonw.unlink()
+
+        with (
+            mock.patch.object(manager.sys, "executable", str(self.python)),
+            mock.patch.object(manager.shutil, "which", return_value="pwsh"),
+            mock.patch.object(manager.subprocess, "run") as run,
+            self.assertRaisesRegex(manager.ManagerError, "CHILD_INSTALL_FAILED"),
+        ):
+            self.services.create_child(self.installer, r"C:\codex\codex.exe", None)
+
+        run.assert_not_called()
+
+    def test_resolved_sibling_outside_runtime_directory_is_rejected(self) -> None:
+        other_dir = self.root / "other-python"
+        other_dir.mkdir()
+        other_pythonw = other_dir / "pythonw.exe"
+        other_pythonw.write_bytes(b"")
+        path_type = type(self.python)
+        original_resolve = path_type.resolve
+
+        def resolve(path: Path, strict: bool = False) -> Path:
+            if path == self.pythonw:
+                return other_pythonw
+            return original_resolve(path, strict=strict)
+
+        with (
+            mock.patch.object(manager.sys, "executable", str(self.python)),
+            mock.patch.object(path_type, "resolve", autospec=True, side_effect=resolve),
+            mock.patch.object(manager.shutil, "which", return_value="pwsh"),
+            mock.patch.object(manager.subprocess, "run") as run,
+            self.assertRaisesRegex(manager.ManagerError, "CHILD_INSTALL_FAILED"),
+        ):
+            self.services.create_child(self.installer, r"C:\codex\codex.exe", None)
+
+        run.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -32,7 +32,7 @@ from typing import Any, Callable, Mapping, Protocol, Sequence
 
 
 UTC = timezone.utc
-APP_VERSION = "2.3.0"
+APP_VERSION = "2.4.0"
 POLICY_SCHEMA_VERSION = 1
 MINIMUM_SCHEDULE_MARGIN_SECONDS = 600
 TASK_START_LEAD_SECONDS = 345
@@ -117,6 +117,31 @@ UI_READY_FILENAME = "manager-ui-ready.json"
 # while tolerating timestamp truncation and a small amount of clock skew.
 UI_SHOW_REQUEST_MAX_AGE_SECONDS = 30
 UI_SHOW_REQUEST_FUTURE_SKEW_SECONDS = 5
+
+
+def _manager_console_python() -> Path:
+    """Return the validated console interpreter beside this manager runtime."""
+    try:
+        running = Path(sys.executable).resolve(strict=True)
+        if running.name.casefold() not in {"python.exe", "pythonw.exe"}:
+            raise ValueError("unexpected manager executable name")
+        runtime_dir = running.parent
+        console = (runtime_dir / "python.exe").resolve(strict=True)
+        windowless = (runtime_dir / "pythonw.exe").resolve(strict=True)
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
+        raise ManagerError("CHILD_INSTALL_FAILED") from error
+    if (
+        not running.is_file()
+        or not console.is_file()
+        or not windowless.is_file()
+        or console.parent != runtime_dir
+        or windowless.parent != runtime_dir
+        or console.name.casefold() != "python.exe"
+        or windowless.name.casefold() != "pythonw.exe"
+        or running not in {console, windowless}
+    ):
+        raise ManagerError("CHILD_INSTALL_FAILED")
+    return console
 
 
 class ManagerError(Exception):
@@ -938,6 +963,7 @@ class RealServices:
         pwsh = shutil.which("pwsh")
         if not pwsh:
             raise ManagerError("POWERSHELL_NOT_FOUND")
+        manager_python = _manager_console_python()
         env = os.environ.copy()
         if runtime_guard:
             env["CODEX_RESET_MANAGER_RUNTIME_GUARD"] = runtime_guard
@@ -950,6 +976,8 @@ class RealServices:
                     "-File",
                     str(installer),
                     "-ManagerChildOnly",
+                    "-PythonPath",
+                    str(manager_python),
                     "-CodexPath",
                     codex_path,
                     "-Confirm:$false",

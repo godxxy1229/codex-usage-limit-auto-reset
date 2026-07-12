@@ -283,11 +283,539 @@ Write-Output $marker.ReadyAtUtc.GetType().FullName
 """
 
 
+PYTHON_VALIDATOR_HARNESS = r"""
+$ErrorActionPreference = 'Stop'
+$tokens = $null
+$parseErrors = $null
+$ast = [Management.Automation.Language.Parser]::ParseFile(
+    $env:INSTALLER_SOURCE,
+    [ref] $tokens,
+    [ref] $parseErrors
+)
+if ($parseErrors.Count -ne 0) { throw 'Installer source did not parse.' }
+foreach ($name in @('Resolve-CanonicalFile', 'ConvertTo-CompatiblePythonRuntime')) {
+    $node = $ast.FindAll({
+        param($candidate)
+        $candidate -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $candidate.Name -eq $name
+    }, $true) | Select-Object -First 1
+    if ($null -eq $node) { throw "Missing installer function: $name" }
+    . ([scriptblock]::Create($node.Extent.Text))
+}
+$probe = $env:PYTHON_PROBE | ConvertFrom-Json -Depth 20
+ConvertTo-CompatiblePythonRuntime -Path $env:PYTHON_PATH -Probe $probe |
+    Select-Object Path, WindowlessPath, Version |
+    ConvertTo-Json -Compress
+"""
+
+
+PYTHON_REAL_PROBE_HARNESS = r"""
+$ErrorActionPreference = 'Stop'
+$tokens = $null
+$parseErrors = $null
+$ast = [Management.Automation.Language.Parser]::ParseFile(
+    $env:INSTALLER_SOURCE,
+    [ref] $tokens,
+    [ref] $parseErrors
+)
+if ($parseErrors.Count -ne 0) { throw 'Installer source did not parse.' }
+foreach ($name in @(
+    'Resolve-CanonicalFile', 'Get-PythonRuntimeProbe',
+    'ConvertTo-CompatiblePythonRuntime', 'Get-CompatiblePythonRuntime'
+)) {
+    $node = $ast.FindAll({
+        param($candidate)
+        $candidate -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $candidate.Name -eq $name
+    }, $true) | Select-Object -First 1
+    if ($null -eq $node) { throw "Missing installer function: $name" }
+    . ([scriptblock]::Create($node.Extent.Text))
+}
+Get-CompatiblePythonRuntime -Path $env:PYTHON_PATH |
+    Select-Object Path, WindowlessPath, Version |
+    ConvertTo-Json -Compress
+"""
+
+
+PYTHON_PREFLIGHT_HARNESS = r"""
+$ErrorActionPreference = 'Stop'
+$tokens = $null
+$parseErrors = $null
+$ast = [Management.Automation.Language.Parser]::ParseFile(
+    $env:INSTALLER_SOURCE,
+    [ref] $tokens,
+    [ref] $parseErrors
+)
+foreach ($name in @('Resolve-CanonicalFile', 'Get-CompatiblePythonRuntime')) {
+    $node = $ast.FindAll({
+        param($candidate)
+        $candidate -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $candidate.Name -eq $name
+    }, $true) | Select-Object -First 1
+    . ([scriptblock]::Create($node.Extent.Text))
+}
+function Get-PythonRuntimeProbe {
+    param($Path)
+    [IO.File]::WriteAllText($env:PROBE_SENTINEL, 'executed')
+    throw 'probe should not execute'
+}
+function ConvertTo-CompatiblePythonRuntime { throw 'converter should not execute' }
+Get-CompatiblePythonRuntime -Path $env:PYTHON_PATH
+"""
+
+
+PYTHON_SELECTION_HARNESS = r"""
+$ErrorActionPreference = 'Stop'
+$tokens = $null
+$parseErrors = $null
+$ast = [Management.Automation.Language.Parser]::ParseFile(
+    $env:INSTALLER_SOURCE,
+    [ref] $tokens,
+    [ref] $parseErrors
+)
+$node = $ast.FindAll({
+    param($candidate)
+    $candidate -is [Management.Automation.Language.FunctionDefinitionAst] -and
+        $candidate.Name -eq 'Select-CompatiblePythonRuntime'
+}, $true) | Select-Object -First 1
+if ($null -eq $node) { throw 'Missing Python selector.' }
+. ([scriptblock]::Create($node.Extent.Text))
+$script:hints = $env:PYTHON_HINTS | ConvertFrom-Json -Depth 20
+$script:runtimes = @($env:PYTHON_RUNTIMES | ConvertFrom-Json -Depth 20)
+$script:candidates = @($env:PYTHON_CANDIDATES | ConvertFrom-Json -Depth 20)
+function Get-ExistingPythonRuntimeHints {
+    param($ManifestDirectory)
+    if ($env:BROKEN_MANAGER_HINT -eq 'true') { throw 'mock corrupt ManagerSync XML' }
+    return $script:hints
+}
+function Get-ActivePythonRuntimeHint {
+    param($ManifestDirectory)
+    return $script:hints.ActivePython
+}
+function Get-InstalledPythonCandidates { return @($script:candidates) }
+function Get-CompatiblePythonRuntime {
+    param($Path)
+    $runtime = @($script:runtimes | Where-Object {
+        [StringComparer]::OrdinalIgnoreCase.Equals([string] $_.Path, [string] $Path)
+    }) | Select-Object -First 1
+    if ($null -eq $runtime -or -not [bool] $runtime.Compatible) {
+        throw "mock incompatible runtime: $Path"
+    }
+    return [pscustomobject]@{
+        Path = [string] $runtime.Path
+        WindowlessPath = [string] $runtime.WindowlessPath
+        Version = [string] $runtime.Version
+        VersionObject = [version] ([string] $runtime.Version)
+    }
+}
+$selected = Select-CompatiblePythonRuntime `
+    -RequestedPath $env:REQUESTED_PYTHON `
+    -ManifestDirectory 'C:\manifests' `
+    -ChildOnly:($env:CHILD_ONLY -eq 'true')
+$selected | Select-Object Path, WindowlessPath, Version | ConvertTo-Json -Compress
+"""
+
+
 def _write_content_addressed(directory: Path, prefix: str, suffix: str, content: bytes) -> Path:
     digest = hashlib.sha256(content).hexdigest()
     path = directory / f"{prefix}{digest}{suffix}"
     path.write_bytes(content)
     return path
+
+
+class InstallerPythonRuntimeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.pwsh = shutil.which("pwsh")
+        if not self.pwsh:
+            self.skipTest("PowerShell 7 is unavailable")
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+
+    def tearDown(self) -> None:
+        if hasattr(self, "temporary"):
+            self.temporary.cleanup()
+
+    def make_python_files(self, directory: Path | None = None) -> tuple[Path, Path]:
+        runtime = directory or (self.root / "Python")
+        runtime.mkdir(parents=True, exist_ok=True)
+        python = runtime / "python.exe"
+        pythonw = runtime / "pythonw.exe"
+        python.write_bytes(b"fixture")
+        pythonw.write_bytes(b"fixture")
+        return python, pythonw
+
+    @staticmethod
+    def valid_probe(path: Path, *, minor: int = 13) -> dict[str, object]:
+        return {
+            "implementation": "CPython",
+            "major": 3,
+            "minor": minor,
+            "micro": 7,
+            "releaselevel": "final",
+            "executable": str(path),
+            "baseInstallation": True,
+            "gilDisabledBuild": False,
+            "capabilities": {
+                "tkinterTtk": True,
+                "ctypesWindows": True,
+                "msvcrt": True,
+                "createNoWindow": True,
+            },
+        }
+
+    def invoke_validator(
+        self, path: Path, probe: dict[str, object]
+    ) -> subprocess.CompletedProcess[str]:
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "INSTALLER_SOURCE": str(INSTALLER_SOURCE),
+                "PYTHON_PATH": str(path),
+                "PYTHON_PROBE": json.dumps(probe),
+            }
+        )
+        return subprocess.run(
+            [self.pwsh, "-NoProfile", "-NonInteractive", "-Command", PYTHON_VALIDATOR_HARNESS],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+            check=False,
+            env=environment,
+        )
+
+    def invoke_real_probe(self, path: Path) -> subprocess.CompletedProcess[str]:
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "INSTALLER_SOURCE": str(INSTALLER_SOURCE),
+                "PYTHON_PATH": str(path),
+            }
+        )
+        return subprocess.run(
+            [self.pwsh, "-NoProfile", "-NonInteractive", "-Command", PYTHON_REAL_PROBE_HARNESS],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+            check=False,
+            env=environment,
+        )
+
+    def launcher_runtimes(self) -> list[tuple[Path, tuple[int, int, int, str]]]:
+        launcher = shutil.which("py")
+        if not launcher:
+            return []
+        completed = subprocess.run(
+            [launcher, "-0p"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+            check=False,
+        )
+        result: list[tuple[Path, tuple[int, int, int, str]]] = []
+        for line in completed.stdout.splitlines():
+            marker = line.lower().find(":\\")
+            if marker <= 0:
+                continue
+            path = Path(line[marker - 1 :].strip().rstrip("*").strip())
+            if not path.is_file() or path.name.lower() != "python.exe":
+                continue
+            version = subprocess.run(
+                [str(path), "-I", "-c", "import sys; print(sys.version_info.major, sys.version_info.minor, sys.version_info.micro, sys.version_info.releaselevel)"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=30,
+                check=True,
+            ).stdout.strip().split()
+            result.append((path, (int(version[0]), int(version[1]), int(version[2]), version[3])))
+        return result
+
+    def test_real_probe_accepts_installed_313_and_rejects_installed_314_rc(self) -> None:
+        runtimes = self.launcher_runtimes()
+        final_313 = next(
+            (path for path, version in runtimes if version[:2] == (3, 13) and version[3] == "final"),
+            None,
+        )
+        prerelease_314 = next(
+            (path for path, version in runtimes if version[:2] == (3, 14) and version[3] != "final"),
+            None,
+        )
+        if final_313 is None or prerelease_314 is None:
+            self.skipTest("installed final CPython 3.13 and prerelease CPython 3.14 are required")
+        accepted = self.invoke_real_probe(final_313)
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        self.assertEqual(json.loads(accepted.stdout.strip().splitlines()[-1])["Version"][:5], "3.13.")
+        rejected = self.invoke_real_probe(prerelease_314)
+        self.assertNotEqual(rejected.returncode, 0, rejected.stdout)
+        self.assertIn("Prerelease", rejected.stderr)
+
+    def test_accepts_final_gil_cpython_311_and_all_future_3x_minors(self) -> None:
+        python, _ = self.make_python_files()
+        for minor in (11, 12, 13, 14, 15, 99):
+            with self.subTest(minor=minor):
+                completed = self.invoke_validator(python, self.valid_probe(python, minor=minor))
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                result = json.loads(completed.stdout.strip().splitlines()[-1])
+                self.assertEqual(result["Version"], f"3.{minor}.7")
+
+    def test_rejects_unsupported_implementation_release_build_and_environment(self) -> None:
+        python, _ = self.make_python_files()
+        mutations: dict[str, tuple[str, object, str]] = {
+            "old": ("minor", 10, "3.11 or newer"),
+            "prerelease": ("releaselevel", "candidate", "Prerelease"),
+            "free-threaded": ("gilDisabledBuild", True, "Free-threaded"),
+            "pypy": ("implementation", "PyPy", "must be CPython"),
+            "venv": ("baseInstallation", False, "Virtual environments"),
+        }
+        for label, (field, value, message) in mutations.items():
+            with self.subTest(label=label):
+                probe = self.valid_probe(python)
+                probe[field] = value
+                completed = self.invoke_validator(python, probe)
+                self.assertNotEqual(completed.returncode, 0, completed.stdout)
+                self.assertIn(message, completed.stderr)
+
+    def test_rejects_windowsapps_alias_missing_pythonw_and_missing_capabilities(self) -> None:
+        alias, _ = self.make_python_files(self.root / "Microsoft" / "WindowsApps")
+        completed = self.invoke_validator(alias, self.valid_probe(alias))
+        self.assertNotEqual(completed.returncode, 0, completed.stdout)
+        self.assertIn("WindowsApps", completed.stderr)
+
+        python, pythonw = self.make_python_files(self.root / "NoPythonw")
+        pythonw.unlink()
+        completed = self.invoke_validator(python, self.valid_probe(python))
+        self.assertNotEqual(completed.returncode, 0, completed.stdout)
+        self.assertIn("pythonw.exe", completed.stderr)
+
+        python, _ = self.make_python_files(self.root / "Capabilities")
+        for capability in ("tkinterTtk", "ctypesWindows", "msvcrt", "createNoWindow"):
+            with self.subTest(capability=capability):
+                probe = self.valid_probe(python)
+                probe["capabilities"][capability] = False  # type: ignore[index]
+                completed = self.invoke_validator(python, probe)
+                self.assertNotEqual(completed.returncode, 0, completed.stdout)
+                self.assertIn(capability, completed.stderr)
+
+    def test_windowsapps_alias_is_rejected_before_probe_execution(self) -> None:
+        alias, _ = self.make_python_files(self.root / "Microsoft" / "WindowsApps")
+        sentinel = self.root / "probe-executed.txt"
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "INSTALLER_SOURCE": str(INSTALLER_SOURCE),
+                "PYTHON_PATH": str(alias),
+                "PROBE_SENTINEL": str(sentinel),
+            }
+        )
+        completed = subprocess.run(
+            [self.pwsh, "-NoProfile", "-NonInteractive", "-Command", PYTHON_PREFLIGHT_HARNESS],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+            check=False,
+            env=environment,
+        )
+        self.assertNotEqual(completed.returncode, 0, completed.stdout)
+        self.assertIn("WindowsApps", completed.stderr)
+        self.assertFalse(sentinel.exists())
+
+    def test_rejects_redirected_pythonw_sibling(self) -> None:
+        runtime = self.root / "Redirected"
+        python, pythonw = self.make_python_files(runtime)
+        pythonw.unlink()
+        target = self.root / "other-pythonw.exe"
+        target.write_bytes(b"fixture")
+        try:
+            pythonw.symlink_to(target)
+        except OSError as exc:
+            self.skipTest(f"symbolic links unavailable: {exc}")
+        completed = self.invoke_validator(python, self.valid_probe(python))
+        self.assertNotEqual(completed.returncode, 0, completed.stdout)
+        self.assertIn("real sibling pythonw.exe", completed.stderr)
+
+    def invoke_selector(
+        self,
+        *,
+        requested: str = "",
+        manager: str | None = None,
+        active: str | None = None,
+        candidates: list[str] | None = None,
+        runtimes: list[dict[str, object]] | None = None,
+        child_only: bool = False,
+        broken_manager_hint: bool = False,
+    ) -> subprocess.CompletedProcess[str]:
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "INSTALLER_SOURCE": str(INSTALLER_SOURCE),
+                "REQUESTED_PYTHON": requested,
+                "PYTHON_HINTS": json.dumps(
+                    {"ManagerPython": manager, "ActivePython": active}
+                ),
+                "PYTHON_CANDIDATES": json.dumps(candidates or []),
+                "PYTHON_RUNTIMES": json.dumps(runtimes or []),
+                "CHILD_ONLY": str(child_only).lower(),
+                "BROKEN_MANAGER_HINT": str(broken_manager_hint).lower(),
+            }
+        )
+        return subprocess.run(
+            [self.pwsh, "-NoProfile", "-NonInteractive", "-Command", PYTHON_SELECTION_HARNESS],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+            check=False,
+            env=environment,
+        )
+
+    @staticmethod
+    def runtime(path: str, version: str, *, compatible: bool = True) -> dict[str, object]:
+        return {
+            "Path": path,
+            "WindowlessPath": str(Path(path).with_name("pythonw.exe")),
+            "Version": version,
+            "Compatible": compatible,
+        }
+
+    def test_explicit_path_wins_and_child_mode_requires_it(self) -> None:
+        explicit = r"C:\Explicit\python.exe"
+        manager = r"C:\Sticky\python.exe"
+        completed = self.invoke_selector(
+            requested=explicit,
+            manager=manager,
+            candidates=[r"C:\Newer\python.exe"],
+            runtimes=[self.runtime(explicit, "3.11.9")],
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(json.loads(completed.stdout.strip().splitlines()[-1])["Path"], explicit)
+
+        missing = self.invoke_selector(child_only=True)
+        self.assertNotEqual(missing.returncode, 0, missing.stdout)
+        self.assertIn("explicit -PythonPath", missing.stderr)
+
+        child = self.invoke_selector(
+            requested=explicit,
+            manager=manager,
+            active=r"C:\Other\python.exe",
+            runtimes=[self.runtime(explicit, "3.11.9")],
+            child_only=True,
+        )
+        self.assertEqual(child.returncode, 0, child.stderr)
+
+        recovery = self.invoke_selector(
+            requested=explicit,
+            active=None,
+            runtimes=[self.runtime(explicit, "3.11.9")],
+            broken_manager_hint=True,
+        )
+        self.assertEqual(recovery.returncode, 0, recovery.stderr)
+
+    def test_sticky_tasks_win_and_mismatched_task_directories_fail(self) -> None:
+        sticky = r"C:\Python313\python.exe"
+        newer = r"C:\Python315\python.exe"
+        runtimes = [self.runtime(sticky, "3.13.11"), self.runtime(newer, "3.15.1")]
+        completed = self.invoke_selector(
+            manager=sticky,
+            active=sticky,
+            candidates=[newer],
+            runtimes=runtimes,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(json.loads(completed.stdout.strip().splitlines()[-1])["Path"], sticky)
+
+        mismatch = self.invoke_selector(
+            manager=r"C:\Python311\python.exe",
+            active=sticky,
+            runtimes=runtimes,
+        )
+        self.assertNotEqual(mismatch.returncode, 0, mismatch.stdout)
+        self.assertIn("do not share", mismatch.stderr)
+
+        incompatible = self.invoke_selector(
+            manager=sticky,
+            candidates=[newer],
+            runtimes=[self.runtime(sticky, "3.13.11", compatible=False), self.runtime(newer, "3.15.1")],
+        )
+        self.assertNotEqual(incompatible.returncode, 0, incompatible.stdout)
+        self.assertIn("existing scheduled runtime", incompatible.stderr)
+
+    def test_active_one_shot_blocks_cross_directory_explicit_switch(self) -> None:
+        active = r"C:\Python313\python.exe"
+        requested = r"C:\Python315\python.exe"
+        completed = self.invoke_selector(
+            requested=requested,
+            active=active,
+            runtimes=[self.runtime(requested, "3.15.1")],
+        )
+        self.assertNotEqual(completed.returncode, 0, completed.stdout)
+        self.assertIn("cross-directory", completed.stderr)
+
+        same_directory = self.invoke_selector(
+            requested=r"C:\Python313\python.exe",
+            active=active,
+            runtimes=[self.runtime(active, "3.13.11")],
+        )
+        self.assertEqual(same_directory.returncode, 0, same_directory.stderr)
+
+    def test_fresh_install_selects_newest_valid_candidate(self) -> None:
+        py311 = r"C:\Python311\python.exe"
+        py315 = r"C:\Python315\python.exe"
+        bad = r"C:\PythonBad\python.exe"
+        completed = self.invoke_selector(
+            candidates=[py311, py315, py311, bad],
+            runtimes=[
+                self.runtime(py311, "3.11.9"),
+                self.runtime(py315, "3.15.1"),
+                self.runtime(bad, "3.99.1", compatible=False),
+            ],
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(json.loads(completed.stdout.strip().splitlines()[-1])["Path"], py315)
+
+    def test_discovery_is_read_only_deduplicated_launcher_and_path_enumeration(self) -> None:
+        source = INSTALLER_SOURCE.read_text(encoding="utf-8")
+        start = source.index("function Get-InstalledPythonCandidates")
+        end = source.index("function ConvertFrom-PythonTaskCommand", start)
+        body = source[start:end]
+        self.assertIn("[Collections.Generic.HashSet[string]]", body)
+        self.assertIn("-0p", body)
+        self.assertIn("Get-Command python.exe -All", body)
+        self.assertNotRegex(body, r"-[0-9]+\.[0-9]+")
+
+    def test_probe_checks_windows_capabilities_and_build_gil_flag(self) -> None:
+        source = INSTALLER_SOURCE.read_text(encoding="utf-8")
+        start = source.index("function Get-PythonRuntimeProbe")
+        end = source.index("function ConvertTo-CompatiblePythonRuntime", start)
+        body = source[start:end]
+        self.assertIn("-I -c $probeCode", body)
+        self.assertIn("$lines = @(& $Path -I -c $probeCode", body)
+        self.assertIn('get_config_var("Py_GIL_DISABLED")', body)
+        for capability in ("tkinter.ttk", "WINFUNCTYPE", "msvcrt", "CREATE_NO_WINDOW"):
+            self.assertIn(capability, body)
+
+    def test_selected_runtime_is_rechecked_against_active_snapshot_before_mutation(self) -> None:
+        source = INSTALLER_SOURCE.read_text(encoding="utf-8")
+        snapshot = source.index("$activeOneShotSnapshot = Get-ActiveOneShotSnapshot")
+        comparison = source.index("Assert-SelectedPythonMatchesActiveOneShot", snapshot)
+        policy_snapshot = source.index("$policySnapshot = Get-FileByteSnapshot", comparison)
+        lock = source.index("controller.lock for UI quiescence", policy_snapshot)
+        unchanged = source.index("Assert-ActiveOneShotUnchanged", lock)
+        locked_comparison = source.index("Assert-SelectedPythonMatchesActiveOneShot", unchanged)
+        policy_mutation = source.index("$policyMutationAttempted = $true", locked_comparison)
+        self.assertLess(snapshot, comparison)
+        self.assertLess(comparison, policy_snapshot)
+        self.assertLess(unchanged, locked_comparison)
+        self.assertLess(locked_comparison, policy_mutation)
 
 
 class InstallerAdmissionTests(unittest.TestCase):
