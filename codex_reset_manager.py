@@ -32,7 +32,7 @@ from typing import Any, Callable, Mapping, Protocol, Sequence
 
 
 UTC = timezone.utc
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.2.0"
 POLICY_SCHEMA_VERSION = 1
 MINIMUM_SCHEDULE_MARGIN_SECONDS = 600
 TASK_START_LEAD_SECONDS = 345
@@ -45,6 +45,49 @@ TERMINAL_STATES = {
     "CLEANED",
     "SUPERSEDED_CLI",
 }
+
+_UI_TONE_COLORS = {
+    "neutral": "#202124",
+    "positive": "#067647",
+    "info": "#175CD3",
+    "warning": "#B54708",
+    "danger": "#B42318",
+    "muted": "#667085",
+}
+_UI_POSITIVE_TEXT = {"On", "Compatible", "Synchronized", "SUCCEEDED", "Scheduled"}
+_UI_INFO_TEXT = {"Preparing", "Waiting safely"}
+_UI_WARNING_TEXT = {"Needs attention", "NO_ACTION"}
+_UI_DANGER_TEXT = {"FAILED", "INDETERMINATE"}
+_UI_MUTED_TEXT = {
+    "Paused",
+    "Not checked",
+    "No reservation",
+    "No history",
+    "Checking...",
+    "PENDING",
+    "DISARMED",
+    "CLEANED",
+    "CANCELLED",
+    "CANCEL_REQUESTED",
+}
+
+
+def _ui_tone_for_text(value: object) -> str:
+    """Return a supplemental visual tone without changing status semantics."""
+    text = str(value).strip()
+    if text in _UI_POSITIVE_TEXT:
+        return "positive"
+    if text in _UI_INFO_TEXT:
+        return "info"
+    if text in _UI_WARNING_TEXT:
+        return "warning"
+    if text in _UI_DANGER_TEXT:
+        return "danger"
+    if text in _UI_MUTED_TEXT or text.startswith("SUPERSEDED_"):
+        return "muted"
+    return "neutral"
+
+
 NONTERMINAL_STATES = {"UNARMED", "ARMED", "WAITING", "DISPATCHING"}
 TRANSIENT_PRE_DISPATCH_FAILURES = {
     "PRE_DISPATCH_RPC_ERROR",
@@ -2193,19 +2236,65 @@ def run_ui(controller: Controller) -> int:
     try:
         root = tk.Tk()
         root.title("Codex Reset Credit Manager")
-        root.geometry("540x390")
-        root.minsize(500, 360)
+        root.geometry("600x430")
+        root.minsize(560, 400)
+        root.configure(background="#FFFFFF")
         root.option_add("*Font", ("Segoe UI", 10))
 
-        frame = ttk.Frame(root, padding=20)
+        style = ttk.Style(root)
+        style.configure("Manager.TFrame", background="#FFFFFF")
+        style.configure(
+            "Manager.Title.TLabel",
+            background="#FFFFFF",
+            foreground="#202124",
+            font=("Segoe UI", 18, "bold"),
+        )
+        style.configure(
+            "Manager.Subtitle.TLabel",
+            background="#FFFFFF",
+            foreground="#4B5563",
+            font=("Segoe UI", 10),
+        )
+        style.configure(
+            "Manager.Caption.TLabel",
+            background="#FFFFFF",
+            foreground="#667085",
+            font=("Segoe UI", 10),
+        )
+        for tone, color in _UI_TONE_COLORS.items():
+            style.configure(
+                f"Manager.{tone}.Status.TLabel",
+                background="#FFFFFF",
+                foreground=color,
+                font=(
+                    "Segoe UI",
+                    10,
+                    "bold" if tone in {"positive", "info", "warning", "danger"} else "normal",
+                ),
+            )
+        style.configure(
+            "Manager.Footer.TLabel",
+            background="#FFFFFF",
+            foreground="#667085",
+            font=("Segoe UI", 9),
+        )
+        style.configure("Manager.TButton", font=("Segoe UI", 10), padding=(12, 7))
+
+        frame = ttk.Frame(root, padding=(32, 24, 32, 18), style="Manager.TFrame")
         frame.pack(fill="both", expand=True)
-        title = ttk.Label(frame, text="Codex Reset Credit Manager", font=("Segoe UI", 16, "bold"))
+        title = ttk.Label(
+            frame,
+            text="Codex Reset Credit Manager",
+            style="Manager.Title.TLabel",
+        )
         title.pack(anchor="w")
         subtitle = ttk.Label(
             frame,
             text="Safely uses one selected reset credit about five minutes before it expires.",
+            style="Manager.Subtitle.TLabel",
+            wraplength=520,
         )
-        subtitle.pack(anchor="w", pady=(4, 18))
+        subtitle.pack(anchor="w", pady=(4, 14))
 
         variables = {
             name: tk.StringVar(value="Checking...")
@@ -2220,32 +2309,58 @@ def run_ui(controller: Controller) -> int:
             ("Last result", "result"),
             ("Next reservation", "reservation"),
         )
-        grid = ttk.Frame(frame)
+        grid = ttk.Frame(frame, style="Manager.TFrame")
         grid.pack(fill="x")
+        value_labels: dict[str, Any] = {}
         for row, (caption, name) in enumerate(labels):
-            ttk.Label(grid, text=caption, foreground="#555555").grid(
+            ttk.Label(
+                grid,
+                text=caption,
+                style="Manager.Caption.TLabel",
+            ).grid(
                 row=row,
                 column=0,
                 sticky="w",
                 pady=3,
-                padx=(0, 24),
+                padx=(0, 28),
             )
-            ttk.Label(grid, textvariable=variables[name]).grid(
+            value_label = ttk.Label(
+                grid,
+                textvariable=variables[name],
+                style="Manager.muted.Status.TLabel",
+            )
+            value_label.grid(
                 row=row,
                 column=1,
                 sticky="w",
                 pady=3,
             )
+            value_labels[name] = value_label
+        grid.columnconfigure(0, minsize=172)
         grid.columnconfigure(1, weight=1)
 
-        buttons = ttk.Frame(frame)
-        buttons.pack(fill="x", pady=(22, 0))
-        toggle = ttk.Button(buttons, text="Start Automatic Use")
-        refresh = ttk.Button(buttons, text="Check Now")
-        doctor_button = ttk.Button(buttons, text="Troubleshoot and Logs")
+        buttons = ttk.Frame(frame, style="Manager.TFrame")
+        buttons.pack(fill="x", pady=(20, 0))
+        toggle = ttk.Button(
+            buttons,
+            text="Start Automatic Use",
+            style="Manager.TButton",
+        )
+        refresh = ttk.Button(buttons, text="Check Now", style="Manager.TButton")
+        doctor_button = ttk.Button(
+            buttons,
+            text="Troubleshoot and Logs",
+            style="Manager.TButton",
+        )
         toggle.pack(side="left")
-        refresh.pack(side="left", padx=8)
+        refresh.pack(side="left", padx=10)
         doctor_button.pack(side="left")
+        footer = ttk.Label(
+            frame,
+            text="Automation continues when this window is hidden or exited.",
+            style="Manager.Footer.TLabel",
+        )
+        footer.pack(anchor="w", pady=(14, 0))
         busy = tk.BooleanVar(value=False)
         events: queue.Queue[tuple[str, Any]] = queue.Queue()
         tray_events: queue.Queue[str] = queue.Queue()
@@ -2297,6 +2412,10 @@ def run_ui(controller: Controller) -> int:
                     "attention": "Needs attention",
                 }.get(status.get("reservationStatus"), "Needs attention")
             )
+            for name, label in value_labels.items():
+                label.configure(
+                    style=f"Manager.{_ui_tone_for_text(variables[name].get())}.Status.TLabel"
+                )
             toggle.configure(
                 text="Pause Automatic Use" if status.get("enabled") else "Start Automatic Use"
             )

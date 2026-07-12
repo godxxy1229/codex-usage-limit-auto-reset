@@ -24,10 +24,13 @@ class _Variable:
 
 
 class _Widget:
+    instances: list["_Widget"] = []
+
     def __init__(self, *args: object, **kwargs: object) -> None:
         del args
         self.options = dict(kwargs)
         self.states: list[list[str]] = []
+        self.instances.append(self)
 
     def pack(self, *args: object, **kwargs: object) -> None:
         del args, kwargs
@@ -57,15 +60,22 @@ class _FakeRoot:
         self.withdraw_calls = 0
         self.restore_calls = 0
         self.focus_calls = 0
+        self.title_value: str | None = None
+        self.geometry_value: str | None = None
+        self.minsize_value: tuple[object, ...] | None = None
+        self.options: dict[str, object] = {}
 
     def title(self, value: str) -> None:
-        del value
+        self.title_value = value
 
     def geometry(self, value: str) -> None:
-        del value
+        self.geometry_value = value
 
     def minsize(self, *values: object) -> None:
-        del values
+        self.minsize_value = values
+
+    def configure(self, **kwargs: object) -> None:
+        self.options.update(kwargs)
 
     def option_add(self, *values: object) -> None:
         del values
@@ -174,6 +184,18 @@ class _FakeTray:
         self.running = False
 
 
+class _Style:
+    instance: "_Style | None" = None
+
+    def __init__(self, *args: object) -> None:
+        del args
+        self.configurations: dict[str, dict[str, object]] = {}
+        _Style.instance = self
+
+    def configure(self, name: str, **kwargs: object) -> None:
+        self.configurations[name] = dict(kwargs)
+
+
 class _Controller:
     def __init__(self, root: Path) -> None:
         self.root = root
@@ -200,6 +222,7 @@ def _tk_modules(root: _FakeRoot) -> dict[str, types.ModuleType]:
     tkinter.TclError = RuntimeError
     for name in ("Frame", "Label", "Button"):
         setattr(ttk, name, _Widget)
+    ttk.Style = _Style
     for name in ("showerror", "showinfo", "showwarning"):
         setattr(messagebox, name, lambda *args, **kwargs: None)
     tkinter.ttk = ttk
@@ -217,6 +240,8 @@ class ManagerUiIntegrationTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.root_path = Path(self.temporary.name)
         _FakeTray.instance = None
+        _Style.instance = None
+        _Widget.instances.clear()
 
     def _run(
         self,
@@ -273,6 +298,55 @@ class ManagerUiIntegrationTests(unittest.TestCase):
         self.assertTrue(root.destroyed)
         self.assertFalse(tray.running)
         self.assertEqual(controller.operations, [])
+
+    def test_modern_client_dimensions_styles_and_footer(self) -> None:
+        root, _, _ = self._run(tray_starts=False)
+
+        self.assertEqual(root.geometry_value, "600x430")
+        self.assertEqual(root.minsize_value, (560, 400))
+        self.assertEqual(root.options["background"], "#FFFFFF")
+        assert _Style.instance is not None
+        styles = _Style.instance.configurations
+        self.assertEqual(styles["Manager.Title.TLabel"]["font"], ("Segoe UI", 18, "bold"))
+        self.assertEqual(styles["Manager.TButton"]["padding"], (12, 7))
+        for tone in ("neutral", "positive", "info", "warning", "danger", "muted"):
+            self.assertIn(f"Manager.{tone}.Status.TLabel", styles)
+        self.assertTrue(
+            any(
+                widget.options.get("text")
+                == "Automation continues when this window is hidden or exited."
+                for widget in _Widget.instances
+            )
+        )
+
+    def test_status_text_tones_are_semantic_and_supplemental(self) -> None:
+        expected = {
+            "On": "positive",
+            "Compatible": "positive",
+            "Synchronized": "positive",
+            "SUCCEEDED": "positive",
+            "Scheduled": "positive",
+            "Preparing": "info",
+            "Waiting safely": "info",
+            "Needs attention": "warning",
+            "NO_ACTION": "warning",
+            "FAILED": "danger",
+            "INDETERMINATE": "danger",
+            "Paused": "muted",
+            "Not checked": "muted",
+            "No reservation": "muted",
+            "No history": "muted",
+            "DISARMED": "muted",
+            "CLEANED": "muted",
+            "CANCELLED": "muted",
+            "CANCEL_REQUESTED": "muted",
+            "SUPERSEDED_CLI": "muted",
+            "2030-01-01 10:00:00": "neutral",
+        }
+
+        for text, tone in expected.items():
+            with self.subTest(text=text):
+                self.assertEqual(manager._ui_tone_for_text(text), tone)
 
 
 if __name__ == "__main__":

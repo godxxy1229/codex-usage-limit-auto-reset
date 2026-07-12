@@ -6,9 +6,9 @@ It does not reset or increase Codex quota, create quota-reset tokens, read `auth
 
 Korean documentation is available in [README.ko.md](README.ko.md).
 
-![Codex Reset Credit Manager window showing automatic use enabled and a scheduled reset credit](docs/images/manager-ui-example.svg)
+![Codex Reset Credit Manager window showing automatic use enabled and a scheduled reset credit](docs/images/manager-ui-example.png)
 
-*Manager UI shown with synthetic example data.*
+*Actual manager UI rendered with fixed synthetic status data.*
 
 ## Quick start
 
