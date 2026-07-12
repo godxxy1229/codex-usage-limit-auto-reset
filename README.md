@@ -2,7 +2,7 @@
 
 Codex Usage Limit Reset Manager is a small community-built Windows tool. It automatically uses one selected OpenAI Codex usage limit reset about five minutes before it expires. This toy project combines a few Python and PowerShell scripts, a small Tkinter UI, Windows Task Scheduler, and the local Codex CLI app-server.
 
-ChatGPT displays these as **Usage limit resets**. The local Codex app-server internally represents them as rate-limit reset credits.
+ChatGPT displays these as **Usage limit resets**. Older posts may call them **Codex reset credits**; the local Codex app-server uses rate-limit reset credit terminology internally.
 
 It does not create additional resets, increase plan usage limits, read `auth.json`, or call the backend API directly.
 
