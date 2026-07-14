@@ -1,6 +1,6 @@
 # Codex Usage Limit Reset Manager
 
-Codex Usage Limit Reset Manager is a small community-built Codex reset scheduler for Windows and systemd Linux. It automatically uses one selected OpenAI Codex usage limit reset about five minutes before it expires. This toy project combines a few Python scripts, the local Codex CLI app-server, and the operating system's task scheduler. Windows also has a small Tkinter manager UI.
+Codex Usage Limit Reset Manager is a small open-source Codex reset scheduler for Windows and systemd Linux. It automatically uses one selected OpenAI Codex usage limit reset about five minutes before it expires. This toy project combines a few Python scripts, the local Codex CLI app-server, and the operating system's task scheduler. Windows also has a small Tkinter manager UI.
 
 ChatGPT displays these as **Usage limit resets**. Older posts may call them **Codex reset credits**; the local Codex app-server uses rate-limit reset credit terminology internally.
 

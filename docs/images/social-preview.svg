@@ -7,7 +7,7 @@
 
   <g font-family="Segoe UI, Arial, sans-serif">
     <circle cx="88" cy="116" r="8" fill="#16803c"/>
-    <text x="112" y="124" fill="#667085" font-size="20" font-weight="650" letter-spacing="2.2">COMMUNITY TOOL FOR CODEX</text>
+    <text x="112" y="124" fill="#667085" font-size="20" font-weight="650" letter-spacing="2.2">OPEN-SOURCE TOOL FOR CODEX</text>
 
     <text x="80" y="240" fill="#202124" font-size="66" font-weight="700" letter-spacing="-1.6">Codex Usage Limit</text>
     <text x="80" y="318" fill="#202124" font-size="66" font-weight="700" letter-spacing="-1.6">Reset Manager</text>
