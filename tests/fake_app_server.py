@@ -119,13 +119,19 @@ def main() -> int:
             respond(unsolicited_id, {"unsolicited": True})
 
         if method == "initialize":
+            if os.name == "nt":
+                platform_family, platform_os = "windows", "windows"
+            elif sys.platform.startswith("linux"):
+                platform_family, platform_os = "unix", "linux"
+            else:
+                platform_family, platform_os = "unix", sys.platform
             respond(
                 request_id,
                 {
                     "userAgent": "fake-codex-app-server/0",
-                    "platformFamily": "windows",
-                    "platformOs": "windows",
-                    "codexHome": r"C:\fake-codex-home",
+                    "platformFamily": platform_family,
+                    "platformOs": platform_os,
+                    "codexHome": os.environ.get("CODEX_HOME", r"C:\fake-codex-home"),
                 },
             )
         elif method == "account/read":

@@ -206,6 +206,8 @@ class ManagerUiInstanceTests(unittest.TestCase):
         )
         self.addCleanup(lambda: process.poll() is None and process.kill())
         self.assertEqual(process.stdout.readline().strip(), "ready")
+        contender = manager.UiInstanceLease(self.state_dir)
+        self.assertFalse(contender.acquire())
         process.kill()
         process.communicate(timeout=10)
 

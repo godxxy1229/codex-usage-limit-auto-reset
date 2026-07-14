@@ -8,15 +8,19 @@ The guard only talks to the local Codex app-server.  It never reads
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
 import copy
 import hashlib
 import json
 import math
 import os
+import platform
 import queue
 import re
+import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -31,7 +35,7 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 
 
 UTC = timezone.utc
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.2.0"
 LEGACY_MANIFEST_SCHEMA_VERSION = 1
 MANIFEST_SCHEMA_VERSION = 2
 SUPPORTED_MANIFEST_SCHEMA_VERSIONS = {
@@ -47,6 +51,14 @@ NOTHING_RETRY_SECONDS = 15
 MAX_AMBIGUOUS_REPLAYS = 2
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 15.0
 CONSUME_METHOD = "account/rateLimitResetCredit/consume"
+OFFICIAL_NPM_REGISTRY = "https://registry.npmjs.org/"
+OFFICIAL_CODEX_REPOSITORY = "https://github.com/openai/codex"
+OFFICIAL_CODEX_WORKFLOW = ".github/workflows/rust-release.yml"
+SYSTEMD_CONSUME_TIMER_RE = re.compile(
+    r"codex-reset-consume-[0-9a-f]{12}-[0-9a-f]{8}\.timer"
+)
+LINUX_LIVE_SYSTEM_PATH = "/usr/bin:/bin"
+SYSTEMD_TRIGGER_SETTLE_SECONDS = 30
 SENSITIVE_KEYS = {
     "authorization",
     "accesstoken",
@@ -101,6 +113,51 @@ def _subprocess_creationflags() -> int:
     return subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 
 
+def _is_linux() -> bool:
+    return os.name == "posix" and sys.platform.startswith("linux")
+
+
+def _is_wsl() -> bool:
+    if not _is_linux():
+        return False
+    if os.environ.get("WSL_INTEROP") or os.environ.get("WSL_DISTRO_NAME"):
+        return True
+    try:
+        release = Path("/proc/sys/kernel/osrelease").read_text(
+            encoding="utf-8", errors="replace"
+        )
+    except OSError:
+        return False
+    return "microsoft" in release.casefold()
+
+
+def _assert_supported_linux_host() -> None:
+    if not _is_linux():
+        raise GuardError("Linux support requires a native Linux host")
+    if _is_wsl():
+        raise GuardError("WSL is not supported")
+
+
+def _expected_app_server_platform() -> tuple[str, str]:
+    if _is_linux():
+        _assert_supported_linux_host()
+        return ("unix", "linux")
+    if os.name == "nt":
+        return ("windows", "windows")
+    raise GuardError("this operating system is not supported")
+
+
+def _validate_app_server_platform(initialized: Mapping[str, Any]) -> None:
+    expected_family, expected_os = _expected_app_server_platform()
+    if (
+        initialized.get("platformFamily") != expected_family
+        or initialized.get("platformOs") != expected_os
+    ):
+        raise ProtocolError(
+            f"app-server platform is not {expected_family}/{expected_os}"
+        )
+
+
 class GuardError(Exception):
     """A deterministic fail-closed guard error."""
 
@@ -115,6 +172,14 @@ class SafetyCheckError(GuardError):
     def __init__(self, check: str, message: str) -> None:
         super().__init__(message)
         self.check = check
+
+
+class SystemdTriggerInProgressError(GuardError):
+    """The one-shot timer fired and its service is still starting or running."""
+
+
+class SystemdTriggerElapsedError(GuardError):
+    """The one-shot timer elapsed without a terminal manifest result."""
 
 
 class RpcError(GuardError):
@@ -881,7 +946,7 @@ class AppServerTransport:
         extra_env: Mapping[str, str] | None = None,
     ) -> None:
         self.exe = exe
-        self.codex_home = codex_home
+        self.codex_home = codex_home.expanduser().resolve()
         self.request_timeout = request_timeout
         self.command = list(command) if command is not None else [str(exe), "app-server", "--stdio"]
         self.extra_env = dict(extra_env or {})
@@ -930,8 +995,7 @@ class AppServerTransport:
         )
         if not isinstance(initialized, Mapping):
             raise ProtocolError("initialize result must be an object")
-        if initialized.get("platformFamily") != "windows" or initialized.get("platformOs") != "windows":
-            raise ProtocolError("app-server platform is not Windows")
+        _validate_app_server_platform(initialized)
         if os.path.normcase(os.path.normpath(str(initialized.get("codexHome")))) != os.path.normcase(
             os.path.normpath(str(self.codex_home))
         ):
@@ -1123,10 +1187,22 @@ def _consume_exact(
 def _find_native_codex(explicit: str | None = None) -> Path:
     candidate = explicit or os.environ.get("CODEX_RESET_GUARD_CODEX_PATH")
     if candidate:
-        path = Path(candidate).expanduser().resolve()
+        unresolved = Path(candidate).expanduser()
+        if _is_linux() and unresolved.is_symlink():
+            raise GuardError("Codex native executable must not be a symbolic link")
+        path = unresolved.resolve()
         if not path.is_file():
             raise GuardError(f"Codex executable not found: {path}")
+        if _is_linux():
+            _linux_native_package_root(path, require_global=True)
+            discovered = _discover_global_linux_native_codex()
+            if path != discovered:
+                raise GuardError("explicit Codex path is not the unique global npm native binary")
         return path
+    if _is_linux():
+        return _discover_global_linux_native_codex()
+    if os.name != "nt":
+        raise GuardError("native Codex discovery is supported only on Windows and Linux")
     roots: list[Path] = []
     appdata = os.environ.get("APPDATA")
     if appdata:
@@ -1144,6 +1220,240 @@ def _find_native_codex(explicit: str | None = None) -> Path:
         if len(matches) > 1:
             raise GuardError("multiple npm Codex native executables were found")
     raise GuardError("npm Codex native executable was not found")
+
+
+def _discover_global_linux_native_codex() -> Path:
+    _assert_supported_linux_host()
+    package_root = _npm_global_root() / "@openai" / "codex"
+    if not package_root.is_dir():
+        raise GuardError("global npm @openai/codex package was not found")
+    matches: list[Path] = []
+    for path in package_root.rglob("codex"):
+        if not path.is_file() or path.is_symlink():
+            continue
+        relative = str(path.relative_to(package_root)).replace("\\", "/")
+        if re.fullmatch(
+            r"node_modules/@openai/codex-linux-x64/vendor/"
+            r"x86_64-unknown-linux-musl/bin/codex"
+            r"|node_modules/@openai/codex-linux-arm64/vendor/"
+            r"aarch64-unknown-linux-musl/bin/codex",
+            relative,
+        ):
+            matches.append(path.resolve())
+    if len(matches) != 1:
+        if matches:
+            raise GuardError("multiple npm Codex Linux native executables were found")
+        raise GuardError("npm Codex Linux native executable was not found")
+    _linux_native_package_root(matches[0], require_global=True)
+    return matches[0]
+
+
+def _linux_arch_label() -> str:
+    machine = platform.machine().casefold()
+    if machine in {"x86_64", "amd64"}:
+        return "x64"
+    if machine in {"aarch64", "arm64"}:
+        return "arm64"
+    raise GuardError("Linux Codex is supported only on x64 and arm64")
+
+
+def _safe_linux_owner(metadata: os.stat_result, label: str) -> None:
+    getuid = getattr(os, "getuid", None)
+    if not callable(getuid) or metadata.st_uid not in {0, getuid()}:
+        raise GuardError(f"{label} has an unexpected owner")
+
+
+def _validate_safe_linux_path(
+    path: Path, *, label: str, directory: bool, executable: bool = False
+) -> None:
+    if path.is_symlink():
+        raise GuardError(f"{label} must not be a symbolic link")
+    try:
+        metadata = path.stat()
+    except OSError as error:
+        raise GuardError(f"{label} could not be inspected") from error
+    if directory:
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise GuardError(f"{label} is not a directory")
+    elif not stat.S_ISREG(metadata.st_mode):
+        raise GuardError(f"{label} is not a regular file")
+    _safe_linux_owner(metadata, label)
+    if metadata.st_mode & 0o022:
+        raise GuardError(f"{label} is group- or world-writable")
+    if executable and metadata.st_mode & 0o111 == 0:
+        raise GuardError(f"{label} is not executable")
+
+
+def _validate_npm_launcher_link(path: Path, label: str) -> None:
+    try:
+        link_metadata = path.lstat()
+    except OSError as error:
+        raise GuardError(f"{label} could not be inspected") from error
+    _safe_linux_owner(link_metadata, label)
+    if path.is_symlink():
+        try:
+            target = path.resolve(strict=True)
+        except OSError as error:
+            raise GuardError(f"{label} symbolic-link target is invalid") from error
+        _validate_safe_linux_path(
+            target,
+            label=f"{label} symbolic-link target",
+            directory=False,
+            executable=True,
+        )
+        return
+    _validate_safe_linux_path(
+        path, label=label, directory=False, executable=True
+    )
+
+
+def _validated_npm_launcher() -> Path:
+    _assert_supported_linux_host()
+    if "CODEX_RESET_NPM" in os.environ:
+        configured = os.environ["CODEX_RESET_NPM"]
+        candidate = Path(configured).expanduser()
+    else:
+        discovered = shutil.which("npm")
+        if not discovered:
+            raise GuardError("npm is required to locate the global Codex package")
+        candidate = Path(discovered)
+    if not candidate.is_absolute() or candidate.name != "npm":
+        raise GuardError("npm launcher must be an absolute path named npm")
+    try:
+        launcher_directory = candidate.parent.resolve(strict=True)
+    except OSError as error:
+        raise GuardError("npm launcher directory could not be resolved") from error
+    _validate_safe_linux_path(
+        launcher_directory,
+        label="npm launcher directory",
+        directory=True,
+    )
+    launcher = launcher_directory / "npm"
+    _validate_npm_launcher_link(launcher, "npm launcher")
+    _validate_npm_launcher_link(launcher_directory / "node", "npm node runtime")
+    return launcher
+
+
+def _npm_execution_env(npm: Path, base: Mapping[str, str] | None = None) -> dict[str, str]:
+    env = dict(base if base is not None else os.environ)
+    current_path = env.get("PATH", "")
+    entries = [entry for entry in current_path.split(os.pathsep) if entry]
+    launcher_directory = str(npm.parent)
+    env["PATH"] = os.pathsep.join(
+        [launcher_directory, *(entry for entry in entries if entry != launcher_directory)]
+    )
+    return env
+
+
+def _npm_global_root() -> Path:
+    npm = _validated_npm_launcher()
+    try:
+        completed = subprocess.run(
+            [str(npm), "root", "-g"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+            check=False,
+            env=_npm_execution_env(npm),
+            creationflags=_subprocess_creationflags(),
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise GuardError("unable to locate the global npm package root") from error
+    lines = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
+    if completed.returncode != 0 or len(lines) != 1:
+        raise GuardError("npm returned an invalid global package root")
+    root = Path(lines[0]).expanduser()
+    if not root.is_absolute():
+        raise GuardError("npm global package root is not absolute")
+    return root.resolve()
+
+
+def _linux_native_package_root(
+    exe: Path, *, require_global: bool
+) -> tuple[Path, str]:
+    _assert_supported_linux_host()
+    unresolved = exe.expanduser()
+    if unresolved.is_symlink():
+        raise GuardError("Codex native executable must not be a symbolic link")
+    resolved = unresolved.resolve()
+    if not resolved.is_file():
+        raise GuardError("Codex Linux native executable was not found")
+    parts = resolved.parts
+    package_root: Path | None = None
+    for index in range(len(parts) - 2):
+        if parts[index : index + 3] == ("node_modules", "@openai", "codex"):
+            package_root = Path(*parts[: index + 3])
+            break
+    if package_root is None:
+        raise GuardError("Codex executable is not inside the @openai/codex package")
+    relative = str(resolved.relative_to(package_root)).replace("\\", "/")
+    match = re.fullmatch(
+        r"node_modules/@openai/codex-linux-(x64)/vendor/"
+        r"x86_64-unknown-linux-musl/bin/codex"
+        r"|node_modules/@openai/codex-linux-(arm64)/vendor/"
+        r"aarch64-unknown-linux-musl/bin/codex",
+        relative,
+    )
+    if match is None:
+        raise GuardError("Codex executable is not the npm Linux native binary")
+    arch = match.group(1) or match.group(2)
+    if arch != _linux_arch_label():
+        raise GuardError("Codex Linux native binary architecture does not match this host")
+    if require_global:
+        expected_root = (_npm_global_root() / "@openai" / "codex").resolve()
+        if package_root.resolve() != expected_root:
+            raise GuardError("Codex executable is not in the global npm package")
+    _validate_linux_package_tree(package_root.resolve(), arch, resolved)
+    return package_root.resolve(), arch
+
+
+def _validate_linux_executable_security(resolved: Path) -> None:
+    _validate_safe_linux_path(
+        resolved,
+        label="Codex Linux native binary",
+        directory=False,
+        executable=True,
+    )
+
+
+def _validate_linux_package_tree(
+    package_root: Path, arch: str, native_binary: Path
+) -> None:
+    vendor_target = (
+        "x86_64-unknown-linux-musl"
+        if arch == "x64"
+        else "aarch64-unknown-linux-musl"
+    )
+    native_root = (
+        package_root / "node_modules" / "@openai" / f"codex-linux-{arch}"
+    )
+    directories = (
+        package_root,
+        package_root / "node_modules",
+        package_root / "node_modules" / "@openai",
+        native_root,
+        native_root / "vendor",
+        native_root / "vendor" / vendor_target,
+        native_root / "vendor" / vendor_target / "bin",
+    )
+    for directory in directories:
+        _validate_safe_linux_path(
+            directory,
+            label="Codex npm package directory",
+            directory=True,
+        )
+    for metadata_path in (
+        package_root / "package.json",
+        native_root / "package.json",
+    ):
+        _validate_safe_linux_path(
+            metadata_path,
+            label="Codex npm package metadata",
+            directory=False,
+        )
+    _validate_linux_executable_security(native_binary)
 
 
 def _codex_version(exe: Path) -> str:
@@ -1216,6 +1526,8 @@ def _validate_openai_publisher_subject(subject: str) -> None:
 
 def _npm_package_version_for_native(exe: Path) -> str:
     resolved = exe.resolve()
+    if _is_linux():
+        return _linux_local_package_version(resolved, require_global=True)
     parts = resolved.parts
     folded = [part.casefold() for part in parts]
     package_root: Path | None = None
@@ -1242,8 +1554,370 @@ def _npm_package_version_for_native(exe: Path) -> str:
     return version
 
 
+def _read_npm_package_metadata(path: Path) -> Mapping[str, Any]:
+    try:
+        package = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise GuardError("Codex npm package metadata could not be read") from error
+    if not isinstance(package, Mapping):
+        raise GuardError("Codex npm package metadata is invalid")
+    return package
+
+
+def _linux_local_package_version(exe: Path, *, require_global: bool) -> str:
+    package_root, arch = _linux_native_package_root(
+        exe, require_global=require_global
+    )
+    root_package = _read_npm_package_metadata(package_root / "package.json")
+    native_package = _read_npm_package_metadata(
+        package_root
+        / "node_modules"
+        / "@openai"
+        / f"codex-linux-{arch}"
+        / "package.json"
+    )
+    version = root_package.get("version")
+    if (
+        root_package.get("name") != "@openai/codex"
+        or not isinstance(version, str)
+        or re.fullmatch(r"\d+\.\d+\.\d+", version) is None
+    ):
+        raise GuardError("Codex root npm package identity is invalid")
+    if (
+        native_package.get("name") != "@openai/codex"
+        or native_package.get("version") != f"{version}-linux-{arch}"
+    ):
+        raise GuardError("Codex native npm package identity does not match the root package")
+    return version
+
+
+def _linux_provenance_identity(version: str, commit: str) -> str:
+    return (
+        "npm-provenance:repo=openai/codex;"
+        f"workflow={OFFICIAL_CODEX_WORKFLOW};"
+        f"tag=rust-v{version};commit={commit}"
+    )
+
+
+def _validate_linux_provenance_subject(subject: str, version: str) -> str:
+    pattern = re.compile(
+        r"npm-provenance:repo=openai/codex;"
+        r"workflow=\.github/workflows/rust-release\.yml;"
+        rf"tag=rust-v{re.escape(version)};commit=([0-9a-f]{{40}})"
+    )
+    match = pattern.fullmatch(subject) if isinstance(subject, str) else None
+    if match is None:
+        raise GuardError("cached Codex npm provenance identity is invalid")
+    return match.group(1)
+
+
+def _decode_slsa_provenance(item: Mapping[str, Any], version: str) -> str:
+    bundles = item.get("attestationBundles")
+    if not isinstance(bundles, list):
+        raise GuardError("Codex npm provenance bundle is missing")
+    slsa = [
+        bundle
+        for bundle in bundles
+        if isinstance(bundle, Mapping)
+        and bundle.get("predicateType") == "https://slsa.dev/provenance/v1"
+    ]
+    if len(slsa) != 1:
+        raise GuardError("Codex npm provenance bundle is ambiguous")
+    try:
+        encoded = slsa[0]["bundle"]["dsseEnvelope"]["payload"]
+        decoded = base64.b64decode(encoded, validate=True)
+        statement = json.loads(decoded.decode("utf-8"))
+    except (KeyError, TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise GuardError("Codex npm provenance statement is malformed") from error
+    if not isinstance(statement, Mapping) or statement.get("predicateType") != "https://slsa.dev/provenance/v1":
+        raise GuardError("Codex npm provenance predicate changed")
+    package_version = item.get("version")
+    subjects = statement.get("subject")
+    expected_subject = f"pkg:npm/%40openai/codex@{package_version}"
+    if not isinstance(subjects, list) or len(subjects) != 1:
+        raise GuardError("Codex npm provenance subject is missing or ambiguous")
+    subject = subjects[0]
+    digest = subject.get("digest") if isinstance(subject, Mapping) else None
+    if (
+        not isinstance(subject, Mapping)
+        or subject.get("name") != expected_subject
+        or not isinstance(digest, Mapping)
+        or re.fullmatch(r"[0-9a-f]{128}", str(digest.get("sha512", ""))) is None
+    ):
+        raise GuardError("Codex npm provenance subject changed")
+    try:
+        predicate = statement["predicate"]
+        build = predicate["buildDefinition"]
+        workflow = build["externalParameters"]["workflow"]
+        dependencies = build["resolvedDependencies"]
+    except (KeyError, TypeError) as error:
+        raise GuardError("Codex npm provenance build definition is incomplete") from error
+    if not isinstance(workflow, Mapping):
+        raise GuardError("Codex npm provenance workflow is invalid")
+    if (
+        workflow.get("repository") != OFFICIAL_CODEX_REPOSITORY
+        or str(workflow.get("path", "")).lstrip("/") != OFFICIAL_CODEX_WORKFLOW
+        or workflow.get("ref") != f"refs/tags/rust-v{version}"
+    ):
+        raise GuardError("Codex npm provenance is not the approved OpenAI release workflow")
+    if not isinstance(dependencies, list):
+        raise GuardError("Codex npm provenance source dependency is invalid")
+    expected_uri = (
+        f"git+{OFFICIAL_CODEX_REPOSITORY}@refs/tags/rust-v{version}"
+    )
+    commits = []
+    for dependency in dependencies:
+        if not isinstance(dependency, Mapping) or dependency.get("uri") != expected_uri:
+            continue
+        digest = dependency.get("digest")
+        commit = digest.get("gitCommit") if isinstance(digest, Mapping) else None
+        if isinstance(commit, str) and re.fullmatch(r"[0-9a-f]{40}", commit):
+            commits.append(commit)
+    if len(commits) != 1:
+        raise GuardError("Codex npm provenance source commit is missing or ambiguous")
+    return commits[0]
+
+
+def _validate_npm_audit_payload(
+    payload: Mapping[str, Any], version: str, arch: str
+) -> str:
+    if payload.get("invalid") != [] or payload.get("missing") != []:
+        raise GuardError("Codex npm signature or provenance verification failed")
+    verified = payload.get("verified")
+    if not isinstance(verified, list):
+        raise GuardError("npm signature audit result is malformed")
+    expected = {
+        "node_modules/@openai/codex": version,
+        f"node_modules/@openai/codex-linux-{arch}": f"{version}-linux-{arch}",
+    }
+    by_location: dict[str, Mapping[str, Any]] = {}
+    for item in verified:
+        if not isinstance(item, Mapping):
+            raise GuardError("npm signature audit result is malformed")
+        location = item.get("location")
+        if not isinstance(location, str) or location in by_location:
+            raise GuardError("npm signature audit locations are invalid")
+        by_location[location] = item
+    if set(by_location) != set(expected):
+        raise GuardError("npm signature audit did not verify exactly the Codex packages")
+    commits: list[str] = []
+    for location, expected_version in expected.items():
+        item = by_location[location]
+        attestations = item.get("attestations")
+        provenance = (
+            attestations.get("provenance")
+            if isinstance(attestations, Mapping)
+            else None
+        )
+        if (
+            item.get("name") != "@openai/codex"
+            or item.get("version") != expected_version
+            or item.get("registry") != OFFICIAL_NPM_REGISTRY
+            or not isinstance(provenance, Mapping)
+            or provenance.get("predicateType") != "https://slsa.dev/provenance/v1"
+        ):
+            raise GuardError("npm signature audit package identity changed")
+        commits.append(_decode_slsa_provenance(item, version))
+    if len(set(commits)) != 1:
+        raise GuardError("Codex root and native npm packages have different source commits")
+    return _linux_provenance_identity(version, commits[0])
+
+
+def _isolated_npm_env(directory: Path, npm: Path) -> dict[str, str]:
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.upper().startswith("NPM_CONFIG_")
+        and key.upper() not in {"NODE_AUTH_TOKEN", "NPM_TOKEN"}
+    }
+    empty_user = directory / "empty-user.npmrc"
+    empty_global = directory / "empty-global.npmrc"
+    empty_user.write_text("", encoding="utf-8")
+    empty_global.write_text("", encoding="utf-8")
+    env.update(
+        {
+            "NPM_CONFIG_USERCONFIG": str(empty_user),
+            "NPM_CONFIG_GLOBALCONFIG": str(empty_global),
+            "NPM_CONFIG_REGISTRY": OFFICIAL_NPM_REGISTRY,
+            "NPM_CONFIG_IGNORE_SCRIPTS": "true",
+            "NPM_CONFIG_AUDIT": "false",
+            "NPM_CONFIG_FUND": "false",
+            "NPM_CONFIG_CACHE": str(directory / "cache"),
+        }
+    )
+    return _npm_execution_env(npm, env)
+
+
+def observe_cli_pin(codex_path: str | None = None) -> dict[str, str]:
+    """Return a cheap local npm/binary pin without network or app-server I/O."""
+    exe = _find_native_codex(codex_path)
+    package_version = _npm_package_version_for_native(exe)
+    version = _codex_version(exe)
+    _stable_codex_version(version)
+    if version != f"codex-cli {package_version}":
+        raise GuardError("Codex npm package and native binary versions differ")
+    return {
+        "path": str(exe.resolve()),
+        "version": version,
+        "sha256": _sha256_file(exe.resolve()),
+        "packageVersion": package_version,
+    }
+
+
+def observe_pinned_cli_pin(exact_path: str | Path) -> dict[str, str]:
+    """Observe one approved Linux npm binary without following the current global root."""
+    _assert_supported_linux_host()
+    unresolved = Path(exact_path).expanduser()
+    if unresolved.is_symlink():
+        raise GuardError("pinned Codex native executable must not be a symbolic link")
+    exe = unresolved.resolve()
+    package_version = _linux_local_package_version(exe, require_global=False)
+    version = _codex_version(exe)
+    _stable_codex_version(version)
+    if version != f"codex-cli {package_version}":
+        raise GuardError("pinned Codex binary and npm package versions differ")
+    return {
+        "path": str(exe),
+        "version": version,
+        "sha256": _sha256_file(exe),
+        "packageVersion": package_version,
+    }
+
+
+def validate_linux_cli_trust(codex_path: Path) -> dict[str, str]:
+    """Verify a global Linux Codex binary against signed npm provenance."""
+    if not _is_linux():
+        raise GuardError("Linux npm provenance verification requires Linux")
+    before = observe_cli_pin(str(codex_path))
+    exe = Path(before["path"])
+    _package_root, arch = _linux_native_package_root(exe, require_global=True)
+    version = before["packageVersion"]
+    npm = _validated_npm_launcher()
+    with tempfile.TemporaryDirectory(prefix="codex-reset-npm-trust-") as directory_value:
+        directory = Path(directory_value)
+        with contextlib.suppress(OSError):
+            directory.chmod(0o700)
+        (directory / "package.json").write_text(
+            json.dumps({"private": True}, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        env = _isolated_npm_env(directory, npm)
+        try:
+            installed = subprocess.run(
+                [
+                    str(npm),
+                    "install",
+                    "--ignore-scripts",
+                    "--include=optional",
+                    "--no-audit",
+                    "--no-fund",
+                    "--save-exact",
+                    f"@openai/codex@{version}",
+                ],
+                cwd=directory,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=600,
+                check=False,
+                env=env,
+                creationflags=_subprocess_creationflags(),
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise GuardError("isolated Codex npm installation failed") from error
+        if installed.returncode != 0:
+            raise GuardError("isolated Codex npm installation failed")
+        try:
+            audited = subprocess.run(
+                [str(npm), "audit", "signatures", "--include-attestations", "--json"],
+                cwd=directory,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=300,
+                check=False,
+                env=env,
+                creationflags=_subprocess_creationflags(),
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise GuardError("npm signature and provenance audit failed") from error
+        try:
+            audit_payload = json.loads(audited.stdout)
+        except json.JSONDecodeError as error:
+            raise GuardError("npm signature audit result is malformed") from error
+        if audited.returncode != 0 or not isinstance(audit_payload, Mapping):
+            raise GuardError("npm signature and provenance audit failed")
+        signer_subject = _validate_npm_audit_payload(
+            audit_payload, version, arch
+        )
+        vendor_target = (
+            "x86_64-unknown-linux-musl"
+            if arch == "x64"
+            else "aarch64-unknown-linux-musl"
+        )
+        isolated_binary = (
+            directory
+            / "node_modules"
+            / "@openai"
+            / f"codex-linux-{arch}"
+            / "vendor"
+            / vendor_target
+            / "bin"
+            / "codex"
+        )
+        if not isolated_binary.is_file() or isolated_binary.is_symlink():
+            raise GuardError("isolated Codex Linux native binary is missing or ambiguous")
+        if _sha256_file(isolated_binary) != before["sha256"]:
+            raise GuardError("global Codex binary differs from the provenanced npm package")
+    if _validated_npm_launcher() != npm:
+        raise GuardError("npm launcher changed during Codex provenance verification")
+    after = observe_cli_pin(str(exe))
+    validate_binary_pin(before, after)
+    return {
+        "path": after["path"],
+        "version": after["version"],
+        "sha256": after["sha256"],
+        "signerSubject": signer_subject,
+    }
+
+
+def _trusted_linux_binary_info(
+    exe: Path, trusted_binary: Mapping[str, Any]
+) -> BinaryInfo:
+    required = {"codexExe", "codexVersion", "codexSha256", "signerSubject"}
+    if not required.issubset(trusted_binary):
+        raise GuardError("cached Codex approval is incomplete")
+    observed = observe_cli_pin(str(exe))
+    expected = {
+        "path": str(Path(str(trusted_binary["codexExe"])).expanduser().resolve()),
+        "version": str(trusted_binary["codexVersion"]),
+        "sha256": str(trusted_binary["codexSha256"]).lower(),
+    }
+    validate_binary_pin(expected, observed)
+    subject = trusted_binary.get("signerSubject")
+    if not isinstance(subject, str):
+        raise GuardError("cached Codex npm provenance identity is invalid")
+    _validate_linux_provenance_subject(subject, observed["packageVersion"])
+    return BinaryInfo(
+        path=observed["path"],
+        version=observed["version"],
+        sha256=observed["sha256"],
+        signer_subject=subject,
+    )
+
+
 def _binary_info(exe: Path, *, verify_signature: bool = True) -> BinaryInfo:
     resolved = exe.resolve()
+    if verify_signature and _is_linux():
+        trusted = validate_linux_cli_trust(resolved)
+        return BinaryInfo(
+            path=trusted["path"],
+            version=trusted["version"],
+            sha256=trusted["sha256"],
+            signer_subject=trusted["signerSubject"],
+        )
     return BinaryInfo(
         path=str(resolved),
         version=_codex_version(resolved),
@@ -1294,8 +1968,55 @@ def _validate_cli_schema(exe: Path) -> None:
 
 
 def _time_status() -> str:
+    if _is_linux():
+        _assert_supported_linux_host()
+        loginctl = shutil.which("loginctl")
+        geteuid = getattr(os, "geteuid", None)
+        if not loginctl or not callable(geteuid):
+            raise GuardError("loginctl is required to verify login-only Linux operation")
+        try:
+            linger = subprocess.run(
+                [
+                    loginctl,
+                    "show-user",
+                    str(geteuid()),
+                    "-p",
+                    "Linger",
+                    "--value",
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=20,
+                check=False,
+                creationflags=_subprocess_creationflags(),
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise GuardError("Linux user lingering could not be checked") from error
+        if linger.returncode != 0 or linger.stdout.strip() != "no":
+            raise GuardError("Linux user lingering must be disabled")
+        timedatectl = shutil.which("timedatectl")
+        if not timedatectl:
+            raise GuardError("timedatectl is required for Linux time verification")
+        try:
+            completed = subprocess.run(
+                [timedatectl, "show", "-p", "NTPSynchronized", "--value"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=20,
+                check=False,
+                creationflags=_subprocess_creationflags(),
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise GuardError("Linux system time synchronization could not be checked") from error
+        if completed.returncode != 0 or completed.stdout.strip() != "yes":
+            raise GuardError("Linux system time is not NTP synchronized")
+        return "NTPSynchronized=yes"
     if os.name != "nt":
-        raise GuardError("Windows Time verification requires Windows")
+        raise GuardError("system time verification is supported only on Windows and Linux")
     completed = subprocess.run(
         ["w32tm", "/query", "/status"],
         capture_output=True,
@@ -1333,6 +2054,13 @@ def _time_status() -> str:
 def _observe_pinned_binary(manifest: Mapping[str, Any]) -> dict[str, str]:
     runtime = manifest["runtime"]
     exe = Path(runtime["codexExe"])
+    if _is_linux():
+        observed = observe_pinned_cli_pin(exe)
+        return {
+            "path": observed["path"],
+            "version": observed["version"],
+            "sha256": observed["sha256"],
+        }
     info = _binary_info(exe, verify_signature=False)
     return {"path": info.path, "version": info.version, "sha256": info.sha256}
 
@@ -1393,6 +2121,8 @@ def validate_cli_compatibility(
     codex_path: str | None = None,
     codex_home: Path | None = None,
     expected_account_email_sha256: str | None = None,
+    *,
+    trusted_binary: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Perform a complete read-only CLI/account compatibility check.
 
@@ -1403,7 +2133,10 @@ def validate_cli_compatibility(
     exe = _find_native_codex(codex_path)
     home = (codex_home or _default_codex_home()).expanduser().resolve()
     package_version_before = _npm_package_version_for_native(exe)
-    before = _binary_info(exe)
+    if _is_linux() and trusted_binary is not None:
+        before = _trusted_linux_binary_info(exe, trusted_binary)
+    else:
+        before = _binary_info(exe)
     _stable_codex_version(before.version)
     if before.version != f"codex-cli {package_version_before}":
         raise GuardError("Codex npm package and native binary versions differ")
@@ -1417,7 +2150,16 @@ def validate_cli_compatibility(
             validate_account_pin(account, expected_account_email_sha256)
         rates = _read_rate_limits(transport)
         rows = _safe_compatibility_rows(rates)
-    after = _binary_info(exe)
+    if _is_linux():
+        after_observed = observe_cli_pin(str(exe))
+        after = BinaryInfo(
+            path=after_observed["path"],
+            version=after_observed["version"],
+            sha256=after_observed["sha256"],
+            signer_subject=before.signer_subject,
+        )
+    else:
+        after = _binary_info(exe)
     package_version_after = _npm_package_version_for_native(exe)
     _stable_codex_version(after.version)
     if package_version_after != package_version_before:
@@ -1448,8 +2190,209 @@ def _new_transport(exe: Path, codex_home: Path) -> AppServerTransport:
     return AppServerTransport(exe, codex_home)
 
 
+def _systemd_unit_names(task_name: str) -> tuple[str, str]:
+    if not isinstance(task_name, str) or SYSTEMD_CONSUME_TIMER_RE.fullmatch(task_name) is None:
+        raise GuardError("systemd consume timer name is invalid")
+    return task_name, task_name[: -len(".timer")] + ".service"
+
+
+def _systemd_user_unit_directory() -> Path:
+    # The installer intentionally pins the systemd user-unit search path
+    # instead of allowing ambient XDG_CONFIG_HOME to redirect live validation.
+    return Path.home().resolve() / ".config" / "systemd" / "user"
+
+
+def _secure_systemd_unit_directory(path: Path) -> None:
+    if path.is_symlink() or not path.is_dir():
+        raise GuardError(
+            "systemd user unit directory is missing or is a symbolic link"
+        )
+    metadata = path.stat()
+    getuid = getattr(os, "getuid", None)
+    if not callable(getuid) or metadata.st_uid != getuid():
+        raise GuardError("systemd user unit directory has an unexpected owner")
+    if metadata.st_mode & 0o022:
+        raise GuardError("systemd user unit directory is group- or world-writable")
+
+
+def _systemd_on_calendar(trigger_at_utc: str) -> str:
+    epoch = _parse_iso_utc(trigger_at_utc)
+    return datetime.fromtimestamp(epoch, UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def _systemctl_user(
+    arguments: Sequence[str], *, timeout: float = 20.0
+) -> subprocess.CompletedProcess[str]:
+    _assert_supported_linux_host()
+    systemctl = shutil.which("systemctl")
+    if not systemctl:
+        raise GuardError("systemctl is required for Linux scheduled jobs")
+    env = os.environ.copy()
+    env.update({"LC_ALL": "C", "SYSTEMD_COLORS": "0", "SYSTEMD_PAGER": "cat"})
+    try:
+        return subprocess.run(
+            [systemctl, "--user", *arguments],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            check=False,
+            env=env,
+            creationflags=_subprocess_creationflags(),
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise GuardError("systemd user-manager command failed") from error
+
+
+def _systemd_show(unit_name: str, properties: set[str]) -> dict[str, str]:
+    completed = _systemctl_user(
+        [
+            "show",
+            unit_name,
+            "--no-pager",
+            *(f"--property={name}" for name in sorted(properties)),
+        ]
+    )
+    if completed.returncode != 0:
+        raise GuardError("the systemd user unit was not found")
+    result: dict[str, str] = {}
+    for line in completed.stdout.splitlines():
+        if not line or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key in result:
+            raise GuardError("systemd user unit properties are ambiguous")
+        result[key] = value
+    if set(result) != properties:
+        raise GuardError("systemd user unit properties are incomplete")
+    return result
+
+
+def _secure_systemd_unit_file(path: Path) -> None:
+    if path.is_symlink() or not path.is_file():
+        raise GuardError("systemd user unit file is missing or is a symbolic link")
+    metadata = path.stat()
+    getuid = getattr(os, "getuid", None)
+    if not callable(getuid) or metadata.st_uid != getuid():
+        raise GuardError("systemd user unit file has an unexpected owner")
+    if metadata.st_mode & 0o022:
+        raise GuardError("systemd user unit file is group- or world-writable")
+
+
+def _parse_systemd_unit_file(path: Path) -> dict[str, dict[str, str]]:
+    _secure_systemd_unit_file(path)
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError) as error:
+        raise GuardError("systemd user unit file could not be read") from error
+    sections: dict[str, dict[str, str]] = {}
+    current: dict[str, str] | None = None
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith(("#", ";")):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            name = line[1:-1]
+            if not name or name in sections:
+                raise GuardError("systemd user unit sections are ambiguous")
+            current = {}
+            sections[name] = current
+            continue
+        if current is None or "=" not in line:
+            raise GuardError("systemd user unit syntax changed")
+        key, value = line.split("=", 1)
+        if not key or not value or key in current:
+            raise GuardError("systemd user unit directives are invalid or duplicated")
+        current[key] = value
+    return sections
+
+
+def _single_systemd_word(value: str, label: str) -> str:
+    try:
+        words = shlex.split(value, posix=True)
+    except ValueError as error:
+        raise GuardError(f"systemd {label} quoting is invalid") from error
+    if len(words) != 1:
+        raise GuardError(f"systemd {label} changed")
+    return _decode_systemd_literal_percent(words[0], label)
+
+
+def _decode_systemd_literal_percent(value: str, label: str) -> str:
+    decoded: list[str] = []
+    index = 0
+    while index < len(value):
+        if value[index] != "%":
+            decoded.append(value[index])
+            index += 1
+            continue
+        if index + 1 >= len(value) or value[index + 1] != "%":
+            raise GuardError(f"systemd {label} contains an unapproved percent specifier")
+        decoded.append("%")
+        index += 2
+    return "".join(decoded)
+
+
+def _validate_linux_unit_loaded(
+    unit_name: str,
+    expected_path: Path,
+    *,
+    require_enabled_active: bool,
+    extra_properties: set[str] | None = None,
+) -> dict[str, str]:
+    requested = {
+        "LoadState",
+        "ActiveState",
+        "UnitFileState",
+        "FragmentPath",
+        "DropInPaths",
+        "NeedDaemonReload",
+    }
+    requested.update(extra_properties or set())
+    properties = _systemd_show(
+        unit_name,
+        requested,
+    )
+    if properties["LoadState"] != "loaded":
+        raise GuardError("systemd user unit is not loaded")
+    fragment = Path(properties["FragmentPath"]).expanduser()
+    if not fragment.is_absolute() or fragment.resolve() != expected_path.resolve():
+        raise GuardError("systemd user unit fragment path changed")
+    if properties["DropInPaths"].strip():
+        raise GuardError("systemd user unit has an unapproved drop-in")
+    if properties["NeedDaemonReload"] != "no":
+        raise GuardError("systemd user-manager has not loaded the current unit file")
+    if require_enabled_active and (
+        properties["UnitFileState"] != "enabled"
+        or properties["ActiveState"] != "active"
+    ):
+        raise GuardError("systemd consume timer is not enabled and active")
+    return properties
+
+
+def _validate_linux_task_exists(task_name: str) -> None:
+    timer_name, service_name = _systemd_unit_names(task_name)
+    unit_directory = _systemd_user_unit_directory()
+    _secure_systemd_unit_directory(unit_directory)
+    timer_path = unit_directory / timer_name
+    service_path = unit_directory / service_name
+    _secure_systemd_unit_file(timer_path)
+    _secure_systemd_unit_file(service_path)
+    _validate_linux_unit_loaded(timer_name, timer_path, require_enabled_active=False)
+    _validate_linux_unit_loaded(service_name, service_path, require_enabled_active=False)
+
+
 def _disable_task_best_effort(task_name: str | None) -> bool:
-    if not task_name or os.name != "nt":
+    if not task_name:
+        return False
+    if _is_linux():
+        try:
+            timer_name, _service_name = _systemd_unit_names(task_name)
+            completed = _systemctl_user(["disable", "--now", timer_name])
+        except GuardError:
+            return False
+        return completed.returncode == 0
+    if os.name != "nt":
         return False
     completed = subprocess.run(
         ["schtasks", "/Change", "/TN", task_name, "/Disable"],
@@ -1463,7 +2406,47 @@ def _disable_task_best_effort(task_name: str | None) -> bool:
     return completed.returncode == 0
 
 
+def _delete_task_best_effort(task_name: str | None) -> bool:
+    if not task_name:
+        return False
+    if _is_linux():
+        try:
+            timer_name, service_name = _systemd_unit_names(task_name)
+            _disable_task_best_effort(timer_name)
+            unit_directory = _systemd_user_unit_directory()
+            _secure_systemd_unit_directory(unit_directory)
+            removed = False
+            for unit_name in (timer_name, service_name):
+                path = unit_directory / unit_name
+                try:
+                    path.unlink()
+                    removed = True
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    return False
+            reloaded = _systemctl_user(["daemon-reload"])
+            return removed and reloaded.returncode == 0
+        except GuardError:
+            return False
+    if os.name != "nt":
+        return False
+    completed = subprocess.run(
+        ["schtasks", "/Delete", "/TN", task_name, "/F"],
+        capture_output=True,
+        text=True,
+        errors="replace",
+        timeout=20,
+        check=False,
+        creationflags=_subprocess_creationflags(),
+    )
+    return completed.returncode == 0
+
+
 def _validate_task_exists(task_name: str) -> None:
+    if _is_linux():
+        _validate_linux_task_exists(task_name)
+        return
     if os.name != "nt":
         raise GuardError("Scheduled Tasks require Windows")
     completed = subprocess.run(
@@ -1520,10 +2503,186 @@ def _parse_task_boundary(value: str) -> int:
     return int(parsed.astimezone(UTC).timestamp())
 
 
+def _validate_systemd_task_contract(
+    task_name: str,
+    manifest_path: Path,
+    manifest: Mapping[str, Any],
+    *,
+    require_live_identity: bool,
+) -> None:
+    timer_name, service_name = _systemd_unit_names(task_name)
+    unit_directory = _systemd_user_unit_directory()
+    _secure_systemd_unit_directory(unit_directory)
+    timer_path = unit_directory / timer_name
+    service_path = unit_directory / service_name
+    timer = _parse_systemd_unit_file(timer_path)
+    service = _parse_systemd_unit_file(service_path)
+    if set(timer) != {"Unit", "Timer", "Install"} or set(service) != {"Unit", "Service"}:
+        raise GuardError("systemd consume unit sections changed")
+    if set(timer["Unit"]) != {"Description"} or not timer["Unit"]["Description"].strip():
+        raise GuardError("systemd consume timer Unit section changed")
+    if (
+        set(service["Unit"]) != {"Description", "RefuseManualStart"}
+        or not service["Unit"]["Description"].strip()
+        or service["Unit"]["RefuseManualStart"] != "yes"
+    ):
+        raise GuardError("systemd consume service Unit section changed")
+    expected_timer = {
+        "OnCalendar": _systemd_on_calendar(manifest["schedule"]["triggerAtUtc"]),
+        "Persistent": "true",
+        "RemainAfterElapse": "true",
+        "AccuracySec": "1s",
+        "RandomizedDelaySec": "0",
+        "WakeSystem": "false",
+        "Unit": service_name,
+    }
+    if timer["Timer"] != expected_timer or timer["Install"] != {"WantedBy": "timers.target"}:
+        raise GuardError("systemd consume timer contract changed")
+    expected_service_keys = {
+        "Type",
+        "ExecStart",
+        "WorkingDirectory",
+        "Environment",
+        "Restart",
+        "TimeoutStartSec",
+        "UMask",
+        "NoNewPrivileges",
+    }
+    service_directives = service["Service"]
+    if set(service_directives) != expected_service_keys:
+        raise GuardError("systemd consume service directives changed")
+    try:
+        actual_command = shlex.split(service_directives["ExecStart"], posix=True)
+    except ValueError as error:
+        raise GuardError("systemd consume service command quoting is invalid") from error
+    actual_command = [
+        _decode_systemd_literal_percent(part, "ExecStart")
+        for part in actual_command
+    ]
+    runner = Path(__file__).resolve()
+    expected_command = [
+        str(Path(sys.executable).resolve()),
+        "-I",
+        str(runner),
+        "run",
+        "--manifest",
+        str(manifest_path.resolve()),
+        "--live",
+    ]
+    if actual_command != expected_command:
+        raise GuardError("systemd consume service command changed")
+    expected_working_directory = str(runner.parent.parent.resolve())
+    if service_directives["WorkingDirectory"] != expected_working_directory:
+        raise GuardError("systemd consume service working directory changed")
+    if (
+        _single_systemd_word(
+            service_directives["Environment"], "Environment"
+        )
+        != f"PATH={LINUX_LIVE_SYSTEM_PATH}"
+    ):
+        raise GuardError("systemd consume service environment changed")
+    expected_service = {
+        "Type": "oneshot",
+        "Restart": "no",
+        "TimeoutStartSec": "10min",
+        "UMask": "0077",
+        "NoNewPrivileges": "yes",
+    }
+    for key, expected in expected_service.items():
+        if service_directives[key] != expected:
+            raise GuardError(f"systemd consume service {key} changed")
+    timer_properties = _validate_linux_unit_loaded(
+        timer_name,
+        timer_path,
+        require_enabled_active=True,
+        extra_properties={
+            "SubState",
+            "LastTriggerUSec",
+            "NextElapseUSecRealtime",
+            "NextElapseUSecMonotonic",
+        },
+    )
+    service_properties = _validate_linux_unit_loaded(
+        service_name,
+        service_path,
+        require_enabled_active=False,
+        extra_properties={"MainPID", "InvocationID"},
+    )
+    if service_properties["UnitFileState"] != "static":
+        raise GuardError("systemd consume service state changed")
+    timer_sub_state = timer_properties["SubState"]
+    last_trigger = timer_properties["LastTriggerUSec"].strip()
+    next_realtime = timer_properties["NextElapseUSecRealtime"].strip()
+    next_monotonic = timer_properties["NextElapseUSecMonotonic"].strip()
+    if timer_sub_state == "waiting":
+        if last_trigger or not next_realtime or next_monotonic != "0":
+            raise GuardError("systemd consume timer schedule state changed")
+    elif timer_sub_state in {"running", "elapsed"}:
+        if not last_trigger or next_realtime or next_monotonic != "infinity":
+            raise GuardError("systemd consume timer elapsed state changed")
+    else:
+        raise GuardError("systemd consume timer substate changed")
+    if require_live_identity:
+        if manifest.get("armed") is not True or manifest.get("state") != "ARMED":
+            raise GuardError("systemd live validation requires an armed manifest")
+        if (
+            timer_sub_state != "running"
+            or
+            service_properties["ActiveState"] not in {"activating", "active"}
+            or service_properties["MainPID"] != str(os.getpid())
+            or re.fullmatch(r"[0-9a-f]{32}", service_properties["InvocationID"])
+            is None
+        ):
+            raise GuardError("systemd live consume service identity changed")
+    elif (
+        (manifest.get("state"), manifest.get("armed"))
+        in {("UNARMED", False), ("ARMED", True)}
+    ):
+        active_state = service_properties["ActiveState"]
+        main_pid = service_properties["MainPID"]
+        if timer_sub_state == "waiting" and (
+            active_state != "inactive" or main_pid != "0"
+        ):
+            raise GuardError("systemd pre-arm consume service is already running")
+        if timer_sub_state in {"running", "elapsed"}:
+            if manifest.get("armed") is not True:
+                raise GuardError("systemd unarmed consume timer has already triggered")
+            if active_state in {"activating", "active"}:
+                raise SystemdTriggerInProgressError(
+                    "systemd consume service is already running"
+                )
+            if active_state not in {"inactive", "failed"} or main_pid != "0":
+                raise GuardError("systemd triggered consume service state changed")
+            trigger = _parse_iso_utc(manifest["schedule"]["triggerAtUtc"])
+            if time.time() < trigger + SYSTEMD_TRIGGER_SETTLE_SECONDS:
+                raise SystemdTriggerInProgressError(
+                    "systemd consume timer trigger is still settling"
+                )
+            raise SystemdTriggerElapsedError(
+                "systemd consume timer elapsed without a terminal result"
+            )
+    else:
+        raise GuardError("systemd consume task was validated in an invalid manifest phase")
+    if timer_properties["UnitFileState"] != "enabled":
+        raise GuardError("systemd consume timer enablement changed")
+
+
 def _validate_scheduled_task_contract(
-    task_name: str, manifest_path: Path, manifest: Mapping[str, Any]
+    task_name: str,
+    manifest_path: Path,
+    manifest: Mapping[str, Any],
+    *,
+    require_live_identity: bool = False,
 ) -> None:
     """Revalidate the installed one-shot task immediately before live work."""
+    if _is_linux():
+        _validate_systemd_task_contract(
+            task_name,
+            manifest_path,
+            manifest,
+            require_live_identity=require_live_identity,
+        )
+        return
     if os.name != "nt":
         raise GuardError("Scheduled Tasks require Windows")
     completed = subprocess.run(
@@ -1599,6 +2758,17 @@ def _validate_scheduled_task_contract(
     enabled = _xml_optional_text(settings, "Enabled")
     if enabled not in {None, "true"}:
         raise GuardError("Scheduled Task Enabled changed")
+
+
+def _validate_live_scheduled_task_contract(
+    task_name: str, manifest_path: Path, manifest: Mapping[str, Any]
+) -> None:
+    _validate_scheduled_task_contract(
+        task_name,
+        manifest_path,
+        manifest,
+        require_live_identity=True,
+    )
 
 
 def _finish_cancelled(manifest_path: Path, manifest: dict[str, Any]) -> RunResult:
@@ -1690,7 +2860,7 @@ def _run_guard_impl(
     now_func: Callable[[], float] = time.time,
     binary_observer: Callable[[Mapping[str, Any]], Mapping[str, str]] = _observe_pinned_binary,
     time_verifier: Callable[[], str] = _time_status,
-    task_verifier: Callable[[str, Path, Mapping[str, Any]], None] = _validate_scheduled_task_contract,
+    task_verifier: Callable[[str, Path, Mapping[str, Any]], None] = _validate_live_scheduled_task_contract,
 ) -> RunResult:
     manifest_path = manifest_path.resolve()
     with ManifestLock(manifest_path):
@@ -2096,7 +3266,7 @@ def run_guard(
     now_func: Callable[[], float] = time.time,
     binary_observer: Callable[[Mapping[str, Any]], Mapping[str, str]] = _observe_pinned_binary,
     time_verifier: Callable[[], str] = _time_status,
-    task_verifier: Callable[[str, Path, Mapping[str, Any]], None] = _validate_scheduled_task_contract,
+    task_verifier: Callable[[str, Path, Mapping[str, Any]], None] = _validate_live_scheduled_task_contract,
 ) -> RunResult:
     path = manifest_path.resolve()
 
@@ -2154,12 +3324,21 @@ def _probe(exe: Path, codex_home: Path) -> dict[str, Any]:
 
 
 def _enroll_unlocked(
-    exe: Path, codex_home: Path, manifest_path: Path, *, force: bool
+    exe: Path,
+    codex_home: Path,
+    manifest_path: Path,
+    *,
+    force: bool,
+    trusted_binary_info: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     if manifest_path.exists() and not force:
         raise GuardError(f"manifest already exists: {manifest_path}")
     _validate_cli_schema(exe)
-    binary = _binary_info(exe)
+    binary = (
+        _trusted_linux_binary_info(exe, trusted_binary_info)
+        if _is_linux() and trusted_binary_info is not None
+        else _binary_info(exe)
+    )
     with AppServerTransport(exe, codex_home) as transport:
         identity = _account_identity(_read_account(transport))
         rates = _read_rate_limits(transport)
@@ -2208,15 +3387,45 @@ def _enroll_unlocked(
 
 
 def _enroll(
-    exe: Path, codex_home: Path, manifest_path: Path, *, force: bool
+    exe: Path,
+    codex_home: Path,
+    manifest_path: Path,
+    *,
+    force: bool,
+    trusted_binary_info: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     with ManifestLock(manifest_path):
         manifest = _enroll_unlocked(
-            exe, codex_home, manifest_path, force=force
+            exe,
+            codex_home,
+            manifest_path,
+            force=force,
+            trusted_binary_info=trusted_binary_info,
         )
         with contextlib.suppress(FileNotFoundError):
             _cancel_path(manifest_path).unlink()
         return manifest
+
+
+def enroll_with_approved_cli_pin(
+    *,
+    codex_path: Path,
+    codex_home: Path,
+    manifest_path: Path,
+    approved_pin: Mapping[str, Any],
+    force: bool = False,
+) -> dict[str, Any]:
+    """Enroll on Linux with an exact, previously provenanced policy pin."""
+    _assert_supported_linux_host()
+    exe = _find_native_codex(str(codex_path))
+    _trusted_linux_binary_info(exe, approved_pin)
+    return _enroll(
+        exe,
+        codex_home.expanduser().resolve(),
+        manifest_path.resolve(),
+        force=force,
+        trusted_binary_info=approved_pin,
+    )
 
 
 def _arm_unlocked(manifest_path: Path, task_name: str) -> dict[str, Any]:
@@ -2232,7 +3441,10 @@ def _arm_unlocked(manifest_path: Path, task_name: str) -> dict[str, Any]:
     _time_status()
     observed = _observe_pinned_binary(manifest)
     validate_binary_pin(_manifest_runtime_pin(manifest), observed)
-    _validate_task_exists(task_name)
+    if _is_linux():
+        _validate_scheduled_task_contract(task_name, manifest_path, manifest)
+    else:
+        _validate_task_exists(task_name)
     with AppServerTransport(
         Path(manifest["runtime"]["codexExe"]), Path(manifest["runtime"]["codexHome"])
     ) as transport:
@@ -2323,7 +3535,7 @@ def _build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     def add_runtime_options(command: argparse.ArgumentParser) -> None:
-        command.add_argument("--codex-path", help="absolute npm native codex.exe path")
+        command.add_argument("--codex-path", help="absolute global npm native Codex path")
         command.add_argument("--codex-home", type=Path, default=_default_codex_home())
 
     probe = subparsers.add_parser("probe", help="read-only account and usage-limit-reset probe")
@@ -2351,7 +3563,7 @@ def _build_parser() -> argparse.ArgumentParser:
     disarm = subparsers.add_parser("disarm", help="disarm and disable a job")
     disarm.add_argument("--manifest", type=Path, required=True)
 
-    cleanup = subparsers.add_parser("cleanup", help="delete the scheduled task")
+    cleanup = subparsers.add_parser("cleanup", help="delete the scheduled one-shot job")
     cleanup.add_argument("--manifest", type=Path, required=True)
     cleanup.add_argument("--purge", action="store_true", help="also delete manifest and log")
 
@@ -2419,15 +3631,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 _validate_manifest(manifest)
                 task_name = manifest["task"]["name"]
                 if task_name:
-                    subprocess.run(
-                        ["schtasks", "/Delete", "/TN", task_name, "/F"],
-                        capture_output=True,
-                        text=True,
-                        errors="replace",
-                        timeout=20,
-                        check=False,
-                        creationflags=_subprocess_creationflags(),
-                    )
+                    _delete_task_best_effort(task_name)
                 _update_manifest_state(path, manifest, "CLEANED", armed=False)
                 _log_event(path, manifest, "cleaned", purge=bool(args.purge))
                 log_path = _log_path(path, manifest)

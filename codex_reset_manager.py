@@ -20,6 +20,7 @@ import re
 import shutil
 import subprocess
 import sys
+import sysconfig
 import threading
 import time
 import uuid
@@ -32,7 +33,7 @@ from typing import Any, Callable, Mapping, Protocol, Sequence
 
 
 UTC = timezone.utc
-APP_VERSION = "2.4.0"
+APP_VERSION = "2.5.0"
 POLICY_SCHEMA_VERSION = 1
 MINIMUM_SCHEDULE_MARGIN_SECONDS = 600
 TASK_START_LEAD_SECONDS = 345
@@ -121,6 +122,26 @@ UI_SHOW_REQUEST_FUTURE_SKEW_SECONDS = 5
 
 def _manager_console_python() -> Path:
     """Return the validated console interpreter beside this manager runtime."""
+    if sys.platform.startswith("linux"):
+        try:
+            running = Path(sys.executable).resolve(strict=True)
+            gil_probe = getattr(sys, "_is_gil_enabled", None)
+            gil_enabled = True if not callable(gil_probe) else gil_probe() is True
+            version = sys.version_info
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            raise ManagerError("CHILD_INSTALL_FAILED") from error
+        if (
+            sys.implementation.name != "cpython"
+            or version.major != 3
+            or version.minor < 11
+            or version.releaselevel != "final"
+            or sys.prefix != sys.base_prefix
+            or sysconfig.get_config_var("Py_GIL_DISABLED") in {1, "1"}
+            or not gil_enabled
+            or not running.is_file()
+        ):
+            raise ManagerError("CHILD_INSTALL_FAILED")
+        return running
     try:
         running = Path(sys.executable).resolve(strict=True)
         if running.name.casefold() not in {"python.exe", "pythonw.exe"}:
@@ -169,10 +190,19 @@ def _utc_epoch(value: str) -> int:
         raise ManagerError("MANIFEST_INVALID") from error
 
 
+def _platform_identity(value: str) -> str:
+    """Normalize identifiers only on Windows, whose task/path checks are caseless."""
+    return value.casefold() if os.name == "nt" else value
+
+
 def _default_root() -> Path:
     explicit = os.environ.get("CODEX_RESET_MANAGER_ROOT")
     if explicit:
         return Path(explicit).expanduser().resolve()
+    if sys.platform.startswith("linux"):
+        data_home = os.environ.get("XDG_DATA_HOME")
+        base = Path(data_home).expanduser() if data_home else Path.home() / ".local" / "share"
+        return (base / "codex-usage-limit-auto-reset").resolve()
     local = os.environ.get("LOCALAPPDATA")
     if not local:
         raise ManagerError("LOCALAPPDATA_UNAVAILABLE")
@@ -625,7 +655,7 @@ def _assert_no_policy_secrets(value: Any, key: str | None = None) -> None:
 
 
 def _assert_npm_package_matches_binary(binary: Mapping[str, Any]) -> None:
-    """Require the global @openai/codex package version to match codex.exe."""
+    """Require the global @openai/codex version to match its native binary."""
     try:
         exe = Path(str(binary["path"])).resolve()
         rendered_version = str(binary["version"])
@@ -652,7 +682,11 @@ def _assert_npm_package_matches_binary(binary: Mapping[str, Any]) -> None:
 
 
 class Services(Protocol):
-    def validate_cli(self, expected_account_sha256: str | None) -> Mapping[str, Any]: ...
+    def validate_cli(
+        self,
+        expected_account_sha256: str | None,
+        approved_cli: Mapping[str, Any] | None = None,
+    ) -> Mapping[str, Any]: ...
 
     def time_status(self) -> str: ...
 
@@ -711,7 +745,12 @@ class RealServices:
         self._guard = module
         return module
 
-    def validate_cli(self, expected_account_sha256: str | None) -> Mapping[str, Any]:
+    def validate_cli(
+        self,
+        expected_account_sha256: str | None,
+        approved_cli: Mapping[str, Any] | None = None,
+    ) -> Mapping[str, Any]:
+        del approved_cli
         guard = self._guard_module()
         try:
             helper = getattr(guard, "validate_cli_compatibility", None)
@@ -1004,6 +1043,311 @@ class RealServices:
 
     def notify(self, title: str, message: str, level: str) -> bool:
         return _shell_notification(title, message, level)
+
+
+class LinuxServices(RealServices):
+    """systemd user-manager backend for the headless Linux controller."""
+
+    supports_approved_cli_cache = True
+    _TASK_PATTERN = r"codex-reset-consume-[0-9a-f]{12}-[0-9a-f]{8}\.timer"
+
+    @staticmethod
+    def _systemctl_environment() -> dict[str, str]:
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "LC_ALL": "C",
+                "SYSTEMD_COLORS": "0",
+                "SYSTEMD_PAGER": "cat",
+            }
+        )
+        return environment
+
+    @staticmethod
+    def _systemctl() -> str:
+        executable = shutil.which("systemctl")
+        if not executable:
+            raise ManagerError("SYSTEMD_UNAVAILABLE")
+        return executable
+
+    def validate_cli(
+        self,
+        expected_account_sha256: str | None,
+        approved_cli: Mapping[str, Any] | None = None,
+    ) -> Mapping[str, Any]:
+        del expected_account_sha256
+        guard = self._guard_module()
+        helper = getattr(guard, "validate_cli_compatibility", None)
+        if not callable(helper):
+            raise ManagerError("CLI_VALIDATION_FAILED")
+        trusted_binary: Mapping[str, Any] | None = None
+        try:
+            if isinstance(approved_cli, Mapping):
+                observe = getattr(guard, "observe_cli_pin", None)
+                if not callable(observe):
+                    raise ManagerError("CLI_VALIDATION_FAILED")
+                current = observe(codex_path=None)
+                approved_path = Path(str(approved_cli["codexExe"])).resolve()
+                approved_sha256 = str(approved_cli["codexSha256"]).lower()
+                if (
+                    Path(str(current["path"])).resolve() == approved_path
+                    and str(current["version"]) == str(approved_cli["codexVersion"])
+                    and str(current["sha256"]).lower() == approved_sha256
+                ):
+                    trusted_binary = approved_cli
+            result = helper(
+                codex_path=None,
+                codex_home=None,
+                # Account identity changes are classified by Controller after
+                # the complete response has passed strict parsing.
+                expected_account_email_sha256=None,
+                trusted_binary=trusted_binary,
+            )
+        except Exception as error:
+            raise ManagerError("CLI_VALIDATION_FAILED") from error
+        if not isinstance(result, Mapping) or result.get("compatible") is not True:
+            raise ManagerError("CLI_VALIDATION_FAILED")
+        binary = result.get("binary")
+        if not isinstance(binary, Mapping):
+            raise ManagerError("CLI_VALIDATION_FAILED")
+        _assert_npm_package_matches_binary(binary)
+        return result
+
+    def binary_pin_available(self, job: Job) -> bool:
+        guard = self._guard_module()
+        try:
+            helper = getattr(guard, "observe_pinned_cli_pin", None)
+            if callable(helper):
+                observed = helper(job.codex_exe)
+            else:
+                helper = getattr(guard, "observe_cli_pin", None)
+                if callable(helper):
+                    observed = helper(codex_path=job.codex_exe)
+                else:
+                    fallback = guard._binary_info(
+                        Path(job.codex_exe), verify_signature=False
+                    )
+                    observed = {
+                        "path": fallback.path,
+                        "version": fallback.version,
+                        "sha256": fallback.sha256,
+                    }
+            path = str(observed["path"])
+            version = str(observed["version"])
+            sha256 = str(observed["sha256"])
+            return (
+                Path(path).resolve() == Path(job.codex_exe).resolve()
+                and version == job.codex_version
+                and sha256 == job.codex_sha256
+            )
+        except Exception:
+            return False
+
+    def validate_task(self, job: Job) -> None:
+        if not isinstance(job.task_name, str) or re.fullmatch(self._TASK_PATTERN, job.task_name) is None:
+            raise ManagerError("TASK_CONTRACT_INVALID")
+        guard = self._guard_module()
+        try:
+            manifest = guard._load_json(job.path)
+            guard._validate_manifest(manifest)
+            guard._validate_scheduled_task_contract(job.task_name, job.path, manifest)
+        except Exception as error:
+            in_progress = getattr(guard, "SystemdTriggerInProgressError", None)
+            if isinstance(in_progress, type) and isinstance(error, in_progress):
+                raise ManagerError("TASK_TRIGGER_IN_PROGRESS") from error
+            elapsed = getattr(guard, "SystemdTriggerElapsedError", None)
+            if isinstance(elapsed, type) and isinstance(error, elapsed):
+                raise ManagerError("PRE_DISPATCH_TRIGGER_ELAPSED") from error
+            raise ManagerError("TASK_CONTRACT_INVALID") from error
+
+    def consume_tasks(self) -> Sequence[ScheduledTask]:
+        systemctl = self._systemctl()
+        environment = self._systemctl_environment()
+        try:
+            inventory_commands = (
+                [
+                    systemctl,
+                    "--user",
+                    "list-unit-files",
+                    "--type=timer",
+                    "--no-legend",
+                    "--no-pager",
+                    "--plain",
+                ],
+                [
+                    systemctl,
+                    "--user",
+                    "list-units",
+                    "--all",
+                    "--type=timer",
+                    "--no-legend",
+                    "--no-pager",
+                    "--plain",
+                ],
+            )
+            names: set[str] = set()
+            for command in inventory_commands:
+                completed = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=30,
+                    check=False,
+                    env=environment,
+                    creationflags=WINDOWLESS_SUBPROCESS_FLAGS,
+                )
+                if completed.returncode != 0:
+                    raise ManagerError("TASK_ENUMERATION_FAILED")
+                observed_in_command: set[str] = set()
+                for line in completed.stdout.splitlines():
+                    fields = line.split()
+                    if not fields:
+                        continue
+                    name = fields[0]
+                    if not (
+                        name.startswith("codex-reset-consume-")
+                        and name.endswith(".timer")
+                    ):
+                        continue
+                    if (
+                        re.fullmatch(self._TASK_PATTERN, name) is None
+                        or name in observed_in_command
+                    ):
+                        raise ManagerError("TASK_ENUMERATION_FAILED")
+                    observed_in_command.add(name)
+                    names.add(name)
+            tasks: list[ScheduledTask] = []
+            for name in sorted(names):
+                state = subprocess.run(
+                    [
+                        systemctl,
+                        "--user",
+                        "show",
+                        "--no-pager",
+                        "--property=UnitFileState",
+                        "--property=ActiveState",
+                        name,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=20,
+                    check=False,
+                    env=environment,
+                    creationflags=WINDOWLESS_SUBPROCESS_FLAGS,
+                )
+                if state.returncode != 0:
+                    raise ManagerError("TASK_ENUMERATION_FAILED")
+                properties: dict[str, str] = {}
+                for line in state.stdout.splitlines():
+                    if "=" not in line:
+                        continue
+                    key, value = line.split("=", 1)
+                    if key in properties:
+                        raise ManagerError("TASK_ENUMERATION_FAILED")
+                    properties[key] = value
+                if set(properties) != {"UnitFileState", "ActiveState"}:
+                    raise ManagerError("TASK_ENUMERATION_FAILED")
+                unit_state = properties["UnitFileState"]
+                active_state = properties["ActiveState"]
+                if unit_state not in {"enabled", "disabled"} or active_state not in {
+                    "active",
+                    "inactive",
+                    "failed",
+                }:
+                    raise ManagerError("TASK_ENUMERATION_FAILED")
+                tasks.append(
+                    ScheduledTask(
+                        name=name,
+                        enabled=unit_state == "enabled" or active_state == "active",
+                    )
+                )
+            return tasks
+        except ManagerError:
+            raise
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise ManagerError("TASK_ENUMERATION_FAILED") from error
+
+    def disable_task(self, task_name: str) -> None:
+        if not isinstance(task_name, str) or re.fullmatch(self._TASK_PATTERN, task_name) is None:
+            raise ManagerError("TASK_DISABLE_FAILED")
+        try:
+            disabled = self._guard_module()._disable_task_best_effort(task_name)
+        except Exception as error:
+            raise ManagerError("TASK_DISABLE_FAILED") from error
+        if disabled is not True:
+            raise ManagerError("TASK_DISABLE_FAILED")
+
+    def create_child(
+        self,
+        installer: Path,
+        codex_path: str,
+        runtime_guard: str | None,
+    ) -> Mapping[str, Any]:
+        manager_python = _manager_console_python()
+        guard_path = (
+            Path(runtime_guard).expanduser().resolve()
+            if runtime_guard
+            else self._policy_runtime_guard()
+        )
+        try:
+            installer_path = installer.expanduser().resolve(strict=True)
+            if guard_path is None:
+                raise OSError("guard path is missing")
+            guard_path = guard_path.resolve(strict=True)
+        except (OSError, RuntimeError) as error:
+            raise ManagerError("CHILD_INSTALL_FAILED") from error
+        if (
+            not installer_path.is_file()
+            or installer_path.suffix != ".py"
+            or not guard_path.is_file()
+            or guard_path.suffix != ".py"
+        ):
+            raise ManagerError("CHILD_INSTALL_FAILED")
+        try:
+            completed = subprocess.run(
+                [
+                    str(manager_python),
+                    "-I",
+                    str(installer_path),
+                    "--manager-child-only",
+                    "--install-root",
+                    str(self.root),
+                    "--python-path",
+                    str(manager_python),
+                    "--codex-path",
+                    codex_path,
+                    "--runtime-guard",
+                    str(guard_path),
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=600,
+                check=False,
+                creationflags=WINDOWLESS_SUBPROCESS_FLAGS,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise ManagerError("CHILD_INSTALL_FAILED") from error
+        if completed.returncode != 0:
+            raise ManagerError("CHILD_INSTALL_FAILED")
+        for line in reversed(completed.stdout.splitlines()):
+            with contextlib.suppress(json.JSONDecodeError):
+                parsed = json.loads(line)
+                if (
+                    isinstance(parsed, Mapping)
+                    and set(parsed) == {"manifestPath", "taskName", "jobId"}
+                ):
+                    return parsed
+        raise ManagerError("CHILD_INSTALL_OUTPUT_INVALID")
+
+    def notify(self, title: str, message: str, level: str) -> bool:
+        del title, message, level
+        return False
 
 
 def _shell_notification(title: str, message: str, level: str = "info") -> bool:
@@ -1471,7 +1815,9 @@ class Controller:
         self.controller_lock_path = self.state_dir / "controller.lock"
         self.dispatch_lock_path = self.state_dir / "dispatch.lock"
         self.log_path = self.root / "logs" / "manager.jsonl"
-        self.services = services or RealServices(self.root)
+        self.services = services or (
+            LinuxServices(self.root) if sys.platform.startswith("linux") else RealServices(self.root)
+        )
         self.now = now
 
     def _controller_lock(self) -> FileLock:
@@ -1485,18 +1831,21 @@ class Controller:
         if not value:
             return None
         path = Path(value).expanduser().resolve()
-        if not path.is_file() or path.suffix.casefold() != suffix:
+        if not path.is_file() or _platform_identity(path.suffix) != _platform_identity(suffix):
             raise ManagerError("RUNTIME_HINT_INVALID")
         return str(path)
 
     def _discover_installer(self) -> str | None:
-        explicit = self._runtime_hint("CODEX_RESET_MANAGER_RUNTIME_INSTALLER", ".ps1")
+        suffix = ".py" if sys.platform.startswith("linux") else ".ps1"
+        explicit = self._runtime_hint("CODEX_RESET_MANAGER_RUNTIME_INSTALLER", suffix)
         if explicit:
             return explicit
-        candidates = sorted((self.root / "installers").glob("install-*.ps1"))
+        pattern = "*install_linux-*.py" if sys.platform.startswith("linux") else "install-*.ps1"
+        candidates = sorted((self.root / "installers").glob(pattern))
         if len(candidates) == 1:
             return str(candidates[0].resolve())
-        adjacent = Path(__file__).with_name("install.ps1")
+        adjacent_name = "install_linux.py" if sys.platform.startswith("linux") else "install.ps1"
+        adjacent = Path(__file__).with_name(adjacent_name)
         return str(adjacent.resolve()) if adjacent.is_file() else None
 
     def _load_policy(self) -> dict[str, Any]:
@@ -1505,7 +1854,10 @@ class Controller:
             _validate_policy(policy)
         else:
             policy = _default_policy(self.now())
-        installer = self._runtime_hint("CODEX_RESET_MANAGER_RUNTIME_INSTALLER", ".ps1")
+        installer_suffix = ".py" if sys.platform.startswith("linux") else ".ps1"
+        installer = self._runtime_hint(
+            "CODEX_RESET_MANAGER_RUNTIME_INSTALLER", installer_suffix
+        )
         guard = self._runtime_hint("CODEX_RESET_MANAGER_RUNTIME_GUARD", ".py")
         if installer:
             policy["runtimeInstaller"] = installer
@@ -1541,7 +1893,9 @@ class Controller:
         matches = [job for job in jobs if job.job_id == reference.get("jobId")]
         if len(matches) != 1:
             raise ManagerError("CURRENT_JOB_MISSING")
-        if str(matches[0].path).casefold() != str(Path(reference["manifestPath"]).resolve()).casefold():
+        if _platform_identity(str(matches[0].path)) != _platform_identity(
+            str(Path(reference["manifestPath"]).resolve())
+        ):
             raise ManagerError("CURRENT_JOB_MISMATCH")
         return matches[0]
 
@@ -1581,9 +1935,9 @@ class Controller:
         """
         tasks = list(self.services.consume_tasks())
         enabled = [task for task in tasks if task.enabled]
-        enabled_names = [task.name.casefold() for task in enabled]
+        enabled_names = [_platform_identity(task.name) for task in enabled]
         expected_jobs = [job for job in jobs if not job.terminal and job.task_name]
-        expected_names = [str(job.task_name).casefold() for job in expected_jobs]
+        expected_names = [_platform_identity(str(job.task_name)) for job in expected_jobs]
         valid = (
             len(enabled_names) == len(set(enabled_names))
             and len(expected_names) == len(set(expected_names))
@@ -1630,7 +1984,12 @@ class Controller:
         return sorted(credits, key=lambda item: item.expires_at)
 
     def _validate_runtime(self, policy: dict[str, Any]) -> tuple[Mapping[str, Any], list[Credit]]:
-        snapshot = self.services.validate_cli(policy["accountEmailSha256"])
+        if getattr(self.services, "supports_approved_cli_cache", False):
+            snapshot = self.services.validate_cli(
+                policy["accountEmailSha256"], policy.get("approvedCli")
+            )
+        else:
+            snapshot = self.services.validate_cli(policy["accountEmailSha256"])
         account_hash = snapshot.get("accountEmailSha256")
         if not isinstance(account_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", account_hash):
             raise ManagerError("ACCOUNT_RESPONSE_INVALID")
@@ -1643,12 +2002,31 @@ class Controller:
         if not isinstance(binary, Mapping):
             raise ManagerError("CLI_VALIDATION_FAILED")
         try:
+            approved_at_utc = _utc_text(self.now())
+            previous_approval = policy.get("approvedCli")
+            if isinstance(previous_approval, Mapping):
+                same_binary = (
+                    _platform_identity(
+                        str(Path(str(previous_approval["codexExe"])).resolve())
+                    )
+                    == _platform_identity(str(Path(str(binary["path"])).resolve()))
+                    and str(previous_approval["codexVersion"])
+                    == str(binary["version"])
+                    and str(previous_approval["codexSha256"]).lower()
+                    == str(binary["sha256"]).lower()
+                    and str(previous_approval["signerSubject"])
+                    == str(binary["signerSubject"])
+                )
+                if same_binary and getattr(
+                    self.services, "supports_approved_cli_cache", False
+                ):
+                    approved_at_utc = str(previous_approval["approvedAtUtc"])
             approved = {
                 "codexExe": str(Path(str(binary["path"])).resolve()),
                 "codexVersion": str(binary["version"]),
                 "codexSha256": str(binary["sha256"]).lower(),
                 "signerSubject": str(binary["signerSubject"]),
-                "approvedAtUtc": _utc_text(self.now()),
+                "approvedAtUtc": approved_at_utc,
             }
         except KeyError as error:
             raise ManagerError("CLI_VALIDATION_FAILED") from error
@@ -1810,9 +2188,66 @@ class Controller:
         if not isinstance(value, str) or not value:
             raise ManagerError("RUNTIME_INSTALLER_NOT_FOUND")
         path = Path(value).resolve()
-        if not path.is_file() or path.suffix.casefold() != ".ps1":
+        suffix = ".py" if sys.platform.startswith("linux") else ".ps1"
+        if not path.is_file() or _platform_identity(path.suffix) != _platform_identity(suffix):
             raise ManagerError("RUNTIME_INSTALLER_NOT_FOUND")
         return path
+
+    def _linux_child_snapshot(self) -> tuple[set[str], set[Path]] | None:
+        """Capture only the state needed to undo a failed Linux enrollment."""
+        if not isinstance(self.services, LinuxServices):
+            return None
+        enabled_tasks = {
+            _platform_identity(task.name)
+            for task in self.services.consume_tasks()
+            if task.enabled
+        }
+        manifests = {
+            path.resolve() for path in self.manifest_dir.glob("*.json")
+        }
+        return enabled_tasks, manifests
+
+    def _cleanup_failed_linux_child(
+        self, snapshot: tuple[set[str], set[Path]] | None
+    ) -> None:
+        """Fail closed if a Linux child exits after partially enrolling a job."""
+        if snapshot is None:
+            return
+        enabled_before, manifests_before = snapshot
+        cleanup_failed = False
+
+        # Disable newly-enabled timers before inspecting manifests. A child may
+        # have armed a timer and then died while writing an incomplete manifest.
+        try:
+            tasks_after = list(self.services.consume_tasks())
+        except ManagerError:
+            tasks_after = []
+            cleanup_failed = True
+        for task in tasks_after:
+            if task.enabled and _platform_identity(task.name) not in enabled_before:
+                try:
+                    self.services.disable_task(task.name)
+                except ManagerError:
+                    cleanup_failed = True
+
+        manifests_after = {
+            path.resolve() for path in self.manifest_dir.glob("*.json")
+        }
+        for path in sorted(manifests_after - manifests_before):
+            try:
+                job = _read_job(path)
+            except ManagerError:
+                # The timer inventory above remains authoritative for a
+                # malformed or partially-written child manifest.
+                continue
+            if not job.terminal:
+                try:
+                    self.services.disarm(job)
+                except ManagerError:
+                    cleanup_failed = True
+
+        if cleanup_failed:
+            raise ManagerError("CHILD_INSTALL_CLEANUP_FAILED")
 
     def _create_child(self, policy: dict[str, Any], credits: Sequence[Credit]) -> Job:
         if not credits:
@@ -1824,26 +2259,34 @@ class Controller:
         approved = policy.get("approvedCli")
         if not isinstance(approved, Mapping):
             raise ManagerError("CLI_NOT_APPROVED")
-        self.services.create_child(
-            self._installer_path(policy),
-            str(approved["codexExe"]),
-            policy.get("runtimeGuard"),
-        )
-        jobs = self._jobs()
-        active = [job for job in jobs if not job.terminal]
-        if len(active) != 1:
-            raise ManagerError("CHILD_JOB_NOT_UNIQUE")
-        child = active[0]
-        if not self._credit_matches_job(earliest, child):
-            raise ManagerError("CHILD_TARGET_MISMATCH")
-        policy["currentJob"] = self._current_ref(child)
-        self._notify_once(
-            f"scheduled:{child.job_id}",
-            "Codex Usage Limit Reset Scheduled",
-            f"Automatic use is scheduled for {_local_time(child.process_at)}.",
-        )
-        self._log("scheduled", expiresAtUtc=_utc_text(child.expires_at))
-        return child
+        linux_snapshot = self._linux_child_snapshot()
+        try:
+            self.services.create_child(
+                self._installer_path(policy),
+                str(approved["codexExe"]),
+                policy.get("runtimeGuard"),
+            )
+            jobs = self._jobs()
+            active = [job for job in jobs if not job.terminal]
+            if len(active) != 1:
+                raise ManagerError("CHILD_JOB_NOT_UNIQUE")
+            child = active[0]
+            if not self._credit_matches_job(earliest, child):
+                raise ManagerError("CHILD_TARGET_MISMATCH")
+            policy["currentJob"] = self._current_ref(child)
+            self._notify_once(
+                f"scheduled:{child.job_id}",
+                "Codex Usage Limit Reset Scheduled",
+                f"Automatic use is scheduled for {_local_time(child.process_at)}.",
+            )
+            self._log("scheduled", expiresAtUtc=_utc_text(child.expires_at))
+            return child
+        except ManagerError as error:
+            try:
+                self._cleanup_failed_linux_child(linux_snapshot)
+            except ManagerError as cleanup_error:
+                raise cleanup_error from error
+            raise
 
     def _sync_locked(self, policy: dict[str, Any], jobs: Sequence[Job]) -> dict[str, Any]:
         current = self._adopt(policy, jobs)
@@ -1857,10 +2300,42 @@ class Controller:
         if current is not None and not current.terminal:
             if current.account_sha256 != policy["accountEmailSha256"]:
                 raise ManagerError("ACCOUNT_CHANGED")
-            self.services.validate_task(current)
-            preserve_on_global_cli_failure = (
-                current.pre_dispatch and self.services.binary_pin_available(current)
-            )
+            try:
+                self.services.validate_task(current)
+            except ManagerError as error:
+                if error.code == "TASK_TRIGGER_IN_PROGRESS":
+                    self._save_policy(policy)
+                    return self._status_from(
+                        policy,
+                        current,
+                        time_state="unknown",
+                        reservation="scheduled",
+                    )
+                if error.code != "PRE_DISPATCH_TRIGGER_ELAPSED":
+                    raise
+                self.services.disarm(current)
+                self._quarantine_credit(
+                    policy, current, "PRE_DISPATCH_TRIGGER_ELAPSED"
+                )
+                policy["lastResult"] = {
+                    "state": "NO_ACTION",
+                    "atUtc": _utc_text(self.now()),
+                    "expiresAtUtc": _utc_text(current.expires_at),
+                    "failureCode": "PRE_DISPATCH_TRIGGER_ELAPSED",
+                }
+                policy["currentJob"] = None
+                self._notify_once(
+                    f"terminal:{current.job_id}:NO_ACTION:PRE_DISPATCH_TRIGGER_ELAPSED",
+                    "Codex Usage Limit Reset Result",
+                    "The scheduled timer elapsed without a confirmed result. "
+                    "Automation will continue after this reset expires.",
+                    "warning",
+                )
+                current = None
+            if current is not None:
+                preserve_on_global_cli_failure = (
+                    current.pre_dispatch and self.services.binary_pin_available(current)
+                )
         if not policy["enabled"]:
             self._save_policy(policy)
             return self._status_from(policy, current, time_state="unknown")
@@ -2110,7 +2585,12 @@ class Controller:
             except ManagerError as error:
                 issues.append(error.code)
             try:
-                self.services.validate_cli(policy["accountEmailSha256"])
+                if getattr(self.services, "supports_approved_cli_cache", False):
+                    self.services.validate_cli(
+                        policy["accountEmailSha256"], policy.get("approvedCli")
+                    )
+                else:
+                    self.services.validate_cli(policy["accountEmailSha256"])
             except ManagerError as error:
                 issues.append(error.code)
             if active:
@@ -2178,15 +2658,29 @@ def _local_time(epoch: int) -> str:
     return datetime.fromtimestamp(epoch, UTC).astimezone().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _system_time_label() -> str:
+    return "System time" if sys.platform.startswith("linux") else "Windows time"
+
+
 ERROR_MESSAGES = {
     "ACCOUNT_CHANGED": "The Codex account has changed.",
     "CLI_VALIDATION_FAILED": "Codex CLI compatibility could not be verified.",
-    "TIME_NOT_SYNCHRONIZED": "Windows time is not synchronized.",
+    "TIME_NOT_SYNCHRONIZED": (
+        "System time is not synchronized."
+        if sys.platform.startswith("linux")
+        else "Windows time is not synchronized."
+    ),
     "MULTIPLE_ACTIVE_JOBS": "Multiple active jobs were found, so automation stopped safely.",
-    "TASK_CONTRACT_INVALID": "The Scheduled Task configuration has changed.",
+    "TASK_CONTRACT_INVALID": (
+        "The scheduled job configuration has changed."
+        if sys.platform.startswith("linux")
+        else "The Scheduled Task configuration has changed."
+    ),
     "INSUFFICIENT_LEAD_TIME": "There is not enough time left to schedule this reset safely.",
     "LIVE_DISPATCH_ACTIVE": "A usage limit reset is being used now. Try again shortly.",
     "CONTROLLER_BUSY": "Another manager check is already running.",
+    "SYSTEMD_UNAVAILABLE": "The systemd user manager is unavailable.",
+    "UI_UNAVAILABLE_ON_LINUX": "The manager UI is not available on Linux.",
 }
 
 
@@ -2212,14 +2706,14 @@ def _human_status(status: Mapping[str, Any]) -> str:
         "attention": "Needs attention",
     }.get(status.get("timeStatus"), "Needs attention")
     lines.append(f"Codex CLI: {cli_text}")
-    lines.append(f"Windows time: {time_text}")
+    lines.append(f"{_system_time_label()}: {time_text}")
     if status.get("blockedCode"):
         lines.append(ERROR_MESSAGES.get(str(status["blockedCode"]), "A safety check needs attention."))
     return "\n".join(lines)
 
 
 def _console_print(value: str, *, error: bool = False) -> None:
-    """Write CLI output when a console stream exists (pythonw has neither)."""
+    """Write CLI output when the selected interpreter has a console stream."""
     stream = sys.stderr if error else sys.stdout
     if stream is not None:
         print(value, file=stream)
@@ -2252,6 +2746,8 @@ def _publish_ui_ready(
 
 
 def run_ui(controller: Controller) -> int:
+    if sys.platform.startswith("linux"):
+        raise ManagerError("UI_UNAVAILABLE_ON_LINUX")
     import tkinter as tk
     from tkinter import messagebox, ttk
 
@@ -2333,7 +2829,7 @@ def run_ui(controller: Controller) -> int:
             ("Next reset expires", "expires"),
             ("Scheduled use", "process"),
             ("Codex CLI", "cli"),
-            ("Windows time", "clock"),
+            (_system_time_label(), "clock"),
             ("Last result", "result"),
             ("Next reservation", "reservation"),
         )
@@ -2619,7 +3115,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"%(prog)s {APP_VERSION}")
     parser.add_argument("--root", type=Path, help=argparse.SUPPRESS)
     commands = parser.add_subparsers(dest="command", required=True)
-    commands.add_parser("ui", help="open the small Windows manager")
+    commands.add_parser("ui", help="open the manager interface when available")
     commands.add_parser("enable", help="enable continuous automatic scheduling")
     commands.add_parser("pause", help="pause automation and cancel the active one-shot")
     sync = commands.add_parser("sync", help="check health and reconcile the next one-shot")

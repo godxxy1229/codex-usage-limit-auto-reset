@@ -159,10 +159,14 @@ class ManagerTaskPythonContractTests(unittest.TestCase):
         run.assert_called_once()
 
 
+@unittest.skipUnless(os.name == "nt", "Windows child-installer contract")
 class ManagerChildPythonContractTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
+        environment = mock.patch.dict(manager.os.environ, {"PATH": "test-path"}, clear=True)
+        environment.start()
+        self.addCleanup(environment.stop)
         self.root = Path(self.temporary.name).resolve()
         self.runtime_dir = self.root / "python"
         self.runtime_dir.mkdir()
@@ -202,6 +206,7 @@ class ManagerChildPythonContractTests(unittest.TestCase):
             run.call_args.kwargs["creationflags"],
             manager.WINDOWLESS_SUBPROCESS_FLAGS,
         )
+        self.assertEqual(run.call_args.kwargs["env"], {"PATH": "test-path"})
 
     def test_windowless_manager_passes_exact_sibling_console_python(self) -> None:
         self.assert_exact_console_python(self.invoke(self.pythonw))

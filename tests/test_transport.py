@@ -21,7 +21,7 @@ from codex_reset_guard import (
 
 
 FAKE_SERVER = Path(__file__).with_name("fake_app_server.py")
-FAKE_CODEX_HOME = Path(r"C:\fake-codex-home")
+FAKE_CODEX_HOME = (Path(__file__).resolve().parent / ".fake-codex-home").resolve()
 IDEMPOTENCY_KEY = "4a77335a-4da5-4d0e-a5f6-930d92bc276f"
 
 
